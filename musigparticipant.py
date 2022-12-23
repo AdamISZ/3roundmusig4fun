@@ -82,28 +82,19 @@ class MS3AManager(object):
             if i == self.myindex:
                 continue
             port_to_use = port_base + i
-            self.connect(i, port_to_use)        
+            self.connect(i, port_to_use)
+        reactor.callLater(10.0, self.start_key_exchange)
 
-    def check_for_kickoff(self):
-        """ Intended to be a polling loop.
+    def start_key_exchange(self):
+        """ Arbitrarily, index 0 acts as coordinator,
+        always. The process starts (after a delay) with
+        this participant sending initial key exchange
+        messages.
         """
-        if self.kicked_off:
+        if not self.myindex == 0:
             return
-        try:
-            with open("musigfile" + str(self.myindex) + ".txt", "r") as f:
-                lines = f.readlines()
-                if len(lines) > 0:
-                    print("We saw a line in the file: ", lines[0])
-                    # the 'kicked off' state for each participant means
-                    # that they have sent their key exchange message.
-                    for i in range(self.n):
-                        if i == self.myindex:
-                            continue
-                        self.send_key_exchange_message(i)
-                    self.kicked_off = True
-        except OSError:
-            # ignore non-existence
-            pass
+        for i in range(1, self.n):
+            self.send_key_exchange_message(i)
 
     def check_for_funding(self):
         """ Intended to be a polling loop.
@@ -304,7 +295,7 @@ class MS3AManager(object):
         assert index != self.myindex
         partial_sig = unhexlify(msg.get_vals()[0])
         self.ms3a.receive_ms3a_msg_3(partial_sig, index)
-        if self.ms3a.state == MS3A_STATE_FULLY_SIGNED and self.kicked_off:
+        if self.ms3a.state == MS3A_STATE_FULLY_SIGNED and self.myindex == 0:
             print("We have a full transaction signature: ")
             print(hexlify(self.ms3a.full_signature))
             print("Attempting to broadcast.")
@@ -437,8 +428,6 @@ msg_callbacks = {1: x.receive_key_exchange,
         3: x.receive_commitments,
         4: x.receive_nonces,
         5: x.receive_partial}
-kickoff_loop = task.LoopingCall(x.check_for_kickoff)
-kickoff_loop.start(2.0)
 funding_info_loop = task.LoopingCall(x.check_for_funding)
 funding_info_loop.start(2.0)
 endpoints.serverFromString(reactor,
