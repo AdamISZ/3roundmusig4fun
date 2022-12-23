@@ -79,6 +79,10 @@ These are examples that I used on signet. The fields are: fundingtxid,funding-ou
 
 Obviously this will be cleaned up a bit. The musigaddress is redundant (the code already knows it of course!), and it also only support a 1-in-1-out spend (but that seems fine just for testing).
 
+Example transaction spending a 3 of 3 MuSig on signet: https://mempool.space/signet/tx/5e21e25cfb7d447536c49950ce412b91f0a9a4ec44fd416a66a041eb6ccfa149
+
+(Examples on chain don't show much, and that's kind of the point .. the spending utxo here is a simple p2tr keyspend; for these, the witness is just a single 64 byte Schnorr signature, as per the rules of BIP341.)
+
 Footnote:
 Since we are interested in investigating signature adaptors, especially multiple of them, it is a bit easier and safer to deal with a 3 round variant where **every user-generated point is committed to up-front** (i.e. it's somewhat in the spirit of 'don't roll your own crypto' to commit to everything at the start in those more whacky scenarios, so 3 round is a logical way to start for that.
 
