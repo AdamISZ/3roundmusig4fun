@@ -9,6 +9,7 @@ from twisted.internet import reactor, protocol, task, endpoints
 from bitcointx.core.key import CKey, CPubKey
 from bitcointx.core import (CTxOut, CMutableTransaction,
             CMutableTxInWitness, CMutableOutPoint, CMutableTxIn)
+from bitcointx.wallet import P2TRCoinAddress, CCoinAddress
 from bitcointx.core.script import CScriptWitness
 from jmbitcoin import human_readable_transaction
 
@@ -114,11 +115,16 @@ class MS3AManager(object):
                 lines = f.readlines()
                 if len(lines) > 0:
                     print("We saw a line in the file: ", lines[0])
-                    # the third item must be serialized as per CTxOut
-                    hextxid, strindex, strvalue, hexscript = lines[0].strip().split(",")
+                    # txid:n of the utxo being spent are the first two.
+                    # then, value and script refer to the same utxo, and
+                    # allow us to create a CTxOut for it.
+                    # lastly, we need value, address for the recipient, from
+                    # which we create the transaction output (another CTxOut)
+                    hextxid, strindex, strvalue, inaddress, strvalout, address = lines[0].strip().split(",")
                     for i in range(self.n):
                         self.send_funding_message(i, hextxid,
-                                        int(strindex), int(strvalue), hexscript)
+                                        int(strindex), int(strvalue), inaddress,
+                                        int(strvalout), address)
                     self.funding_received = True
         except OSError:
             # ignore non-existence
@@ -148,11 +154,14 @@ class MS3AManager(object):
             print("Failed to send to {}, message was: {}".format(index, msg.text))
 
     def send_funding_message(self, index: int, hextxid: str, spending_index: int,
-                             value: int, hexscript: str):
+                             value: int, inaddress: str, valueout: int,
+                             addrout: str):
         msg = MS3AMessage(self.myindex, (hextxid,
                                          str(spending_index),
                                          str(value),
-                                         hexscript), 2)
+                                         inaddress,
+                                         str(valueout),
+                                         addrout), 2)
         if index == self.myindex:
             self.receive_funding_notification(msg)
         else:
@@ -274,12 +283,13 @@ class MS3AManager(object):
         txid = unhexlify(msg.get_vals()[0])
         outindex = int(msg.get_vals()[1])
         spent_val = int(msg.get_vals()[2])
-        spent_script = unhexlify(msg.get_vals()[3])
+        spent_script = P2TRCoinAddress(msg.get_vals()[3]).to_scriptPubKey()
         spending_out = CTxOut(spent_val, spent_script)
         outpoint = CMutableOutPoint(txid[::-1], outindex)
         vin = [CMutableTxIn(prevout=outpoint, nSequence=0xffffffff)]
-        outsPK = self.ms3a.musig_address.to_scriptPubKey()
-        vout = [CTxOut(spent_val - 10000, outsPK)]
+        outsPK = CCoinAddress(msg.get_vals()[5]).to_scriptPubKey()
+        receiving_val = int(msg.get_vals()[4])
+        vout = [CTxOut(receiving_val, outsPK)]
         tx2 = CMutableTransaction(vin, vout, nVersion=2)
         self.ms3a.set_transaction_message(tx2, 0, spending_out)
         for i in range(self.n):
