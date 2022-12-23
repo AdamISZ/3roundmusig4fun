@@ -18,7 +18,7 @@ from bip340schnorr import (schnorr_verify, int_from_bytes,
 from bip340schnorr import n as GROUPN
 
 # set to true so the nonces are fixed and all the bytes are repeatable
-DETERMINISTIC_TEST = True
+DETERMINISTIC_TEST = False
 
 # basic musig algorithm:
 # see https://eprint.iacr.org/2018/068.pdf Section 3

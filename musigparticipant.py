@@ -356,15 +356,6 @@ class MS3AFactory(protocol.ServerFactory):
     def register_disconnection(self, p: MS3AProtocol) -> None:
         print("registering disconnection in server factory")
 
-    def send(self, message: MS3AMessage, destination: str) -> bool:
-        if destination not in self.peers:
-            print("sending message {}, destination {} was not in peers {}".format(
-                message.encode(), destination, self.peers))
-            return False
-        proto = self.peers[destination]
-        proto.message(message)
-        return True
-
 class MS3AClientFactory(protocol.ReconnectingClientFactory):
     """ We define a distinct protocol factory for outbound connections.
     """
