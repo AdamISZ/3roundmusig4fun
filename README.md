@@ -3,6 +3,8 @@
 If you want to play with this, for example if you're trying to understand the mechanics of how MuSig concretely works, or if, like me, you're interested in experimenting with signature adaptors (which are now fully possible on Bitcoin), then this repo might be of interest, especially if you're still in a learning stage.
 If you want to do real world work though, there isn't much of interest here, mostly because the underlying crypto operations are being done in an unsafe way in Python.
 
+Here is a 7.5 minute video of what running the code actually does: https://www.youtube.com/watch?v=YhH2zqkJK_w ; culminating in a spending event that looks like a normal p2tr (keypath) spend, like [this](https://mempool.space/signet/tx/5e21e25cfb7d447536c49950ce412b91f0a9a4ec44fd416a66a041eb6ccfa149).
+
 ### Before we begin: how does MuSig work at all?
 
 Those who can, should read the papers:
@@ -78,8 +80,6 @@ cc2829751a75cdc002b25ef897cae4987d5a71919a00e116f36265ac8a4f2769,0,508000,tb1pha
 These are examples that I used on signet. The fields are: fundingtxid,funding-output-index,funding-output-amount,musig-address,amount-to-spend,destinationaddress.
 
 Obviously this will be cleaned up a bit. The musigaddress is redundant (the code already knows it of course!), and it also only support a 1-in-1-out spend (but that seems fine just for testing).
-
-Example transaction spending a 3 of 3 MuSig on signet: https://mempool.space/signet/tx/5e21e25cfb7d447536c49950ce412b91f0a9a4ec44fd416a66a041eb6ccfa149
 
 (Examples on chain don't show much, and that's kind of the point .. the spending utxo here is a simple p2tr keyspend; for these, the witness is just a single 64 byte Schnorr signature, as per the rules of BIP341.)
 
