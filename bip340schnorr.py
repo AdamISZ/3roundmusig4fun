@@ -1,3 +1,16 @@
+""" Attribution:
+    This is a direct copy of the BIP340 reference Python
+    code here:
+    https://github.com/bitcoin/bips/blob/master/bip-0340/reference.py
+    Note two things:
+    1. It's, as mentioned there, completely unsafe and unsuitable
+    for a production scenario.
+    2. It's only used here to do raw arithmetic because this project
+    is for aggregate and adaptor-ized signatures, which are not yet
+    supported directly in the existing Schnorr-supporting code in
+    base libsecp256k1 and related.
+"""
+
 from typing import Tuple, Optional, Any
 import hashlib
 import binascii
