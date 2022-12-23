@@ -83,6 +83,32 @@ Example transaction spending a 3 of 3 MuSig on signet: https://mempool.space/sig
 
 (Examples on chain don't show much, and that's kind of the point .. the spending utxo here is a simple p2tr keyspend; for these, the witness is just a single 64 byte Schnorr signature, as per the rules of BIP341.)
 
+## Reading the code
+
+The module `ms3a.py` (short with MuSig 3-round with adaptors) is organized around an object `MS3A` which manages (a) the key setup and then (b) the 3 messages. Note that since we want to try using adaptors at some point, the first message is now:
+
+* `H(R), H(T)` - where `H` means hash, by default SHA256 and `R`, `T` are elliptic curve points serialized in old-style compressed form, where `R` is the nonce and `T` is an adaptor point. As for now, this `T` is set to something random and unused in signing.
+
+The second round message is purely the opening of the first:
+
+* `R`, `T`
+
+and the third round message is each party sending a partial signature `s` value, i.e. 32 bytes, which is calculated as:
+
+* `s_i = k_i + schnorr_challenge_hash(R_agg || P_agg || sighashmessage) * H(L || P_i) * x_i mod secp256k1_group_N`
+
+This obviously needs some unpacking. Read the extensive comments in the code, but a few notes: 1. the subscript `i` is obviously per participant in the N of N. The value `L` is just the concatenation of all the participants' pubkeys `P_i`, the `x_i` is our privkey corresponding to that, and `R_agg` is just the sum of the `R_i` values, specifically because we're using 3-round.
+
+I did omit there the key setup, but it's probably fairly obvious if you understand the above equation: each "aggregated pubkey" is `H(L||P_i)P_i`.
+
+### The network interaction
+
+Obviously this is just for demonstration purposes, but we have N different instances of `musigparticipant.py`, each one serves on a random TCP port (but they all calculate each others' ports based on the chosen index). They speak a simple protocol with message types and text lines containing fields as defined [here](https://github.com/AdamISZ/3roundmusig4fun/blob/adfdb7112721ac9d009b917294e67b8d1a582600/musigparticipant.py#L58-L64).
+
+The index 0 participant acts as a coordinator and starts off the process, after a delay, sending a key exchange message, which kicks off all the others. Once keys are exchanged they can all publish the address corresponding to $\sum \left(H(L,P_i) P_i\right) $. They then have to wait for the user to fund that address.
+
+After the user funds the address he has to enter the funding details as per above. Then the `MS3AManager` object can kick off sending messages 1, 2 and 3 as described above.
+
 Footnote:
 Since we are interested in investigating signature adaptors, especially multiple of them, it is a bit easier and safer to deal with a 3 round variant where **every user-generated point is committed to up-front** (i.e. it's somewhat in the spirit of 'don't roll your own crypto' to commit to everything at the start in those more whacky scenarios, so 3 round is a logical way to start for that.
 
