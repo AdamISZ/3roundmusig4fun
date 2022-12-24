@@ -34,6 +34,10 @@ What about the multisig address? Taproot changed what addresses mean in a pretty
 
 Using MuSig is using the former. So we set, here, the script to `""`, i.e. deliberately unsatisfiable empty script, so script path spending isn't possible, and we make $P$ be the aggregated public key, negotiated by the MuSig code. More on this below.
 
+### Adaptors
+
+TODO. I will add some explanation here when I add in code to actually do adaptors.
+
 ## Installing dependencies
 
 Like a lot of more casual pet projects, this is unfortunately not self-contained. It requires basically two dependencies, apart from Bitcoin itself which you can run on regtest or signet as is convenient to you.
