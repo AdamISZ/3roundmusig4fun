@@ -24,6 +24,16 @@ With Schnorr, you never add fractions like that, you just add numbers. So signat
 
 The second half of the story is: that isn't safe, at all, due to the business of counterparties talking to each other in a certain order. The one who gets the other guy's key choices first, is able to manipulate his own keys in a way that leads to cheating. The simple way to stop that is to force everyone to *commit* to their keys (and nonces, which are also keys) upfront, before they see the other guys' keys. **And that is 3-round MuSig**, basically. MuSig2 achieves the same effect, in a more sophisticated way, using algebra on keys such that you don't need to actually *send* that commitment - and that's all I'll say about it here. If you want more, read the aforementioned paper and the draft MuSig2 BIP.
 
+### And in Bitcoin, and taproot?
+
+The end result is that a "MuSig signature" published on the Bitcoin network is just the same as a non-MuSig signature. They're both Schnorr signatures, conforming to the standard defined in [BIP340](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki). They look like: $(R, s)$ where each of $R$ and $s$ are 32 bytes. And this is always the same, whether MuSig is a aggregated signature for 2 counterparties, or for 999 counterparties. The latter is of course 100% impossible with pre-existing multisignature techniques.
+
+The point is that MuSig itself **does not have to be specified in the Bitcoin protocol**. When nodes verify such a transaction, they have no idea that any such thing is happening, and nor does any "blockchain analysis" reveal it. They just see $(R, s)$. The privacy effect of this is not to be underestimated.
+
+What about the multisig address? Taproot changed what addresses mean in a pretty significant way. Previously, we had: single key addresses, then "pay to (witness) script hash" addresses - in the latter, any non-single-key address would have some complex script that got hashed, and then the script "printed out" when you spent from it. Now, all addresses represent a key of the form $P + \mathbb{H}(S)G$ where $S$ is a script, and $P$ is a normal pubkey. Meaning that if you know the private key of $P$, $x$, then you could spend using the private key $x + \mathbb{H}(S)$ - this is called **key path spending**. Or you could just reveal the script $S$ and satisfy its conditions (example: 3 of 4 keys after a timelock) - this is called **script path spending**.
+
+Using MuSig is using the former. So we set, here, the script to `""`, i.e. deliberately unsatisfiable empty script, so script path spending isn't possible, and we make $P$ be the aggregated public key, negotiated by the MuSig code. More on this below.
+
 ## Installing dependencies
 
 Like a lot of more casual pet projects, this is unfortunately not self-contained. It requires basically two dependencies, apart from Bitcoin itself which you can run on regtest or signet as is convenient to you.
