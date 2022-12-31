@@ -198,15 +198,21 @@ class MS3AManager(object):
             msg_callbacks[msgtype](message)
             return
     
-    def receive_key_exchange(self, msg: MS3AMessage):
+    def receive_key_exchange(self, msg: MS3AMessage) -> None:
         index = msg.get_counterparty_index()
+        if self.ms3a.keys[index]:
+            # TODO clean up so they don't send repeats;
+            # currently the instigator (index 0) can send
+            # repeats, depending on context.
+            print("Already received key; ignoring repeat.")
+            return
         assert index != self.myindex
         try:
             pub = CPubKey(unhexlify(msg.get_vals()[0]))
         except:
             print("Failed key exchange message: ", msg)
             return
-        if self.ms3a.set_base_pubkey(pub, index):
+        if not self.ms3a.musig_address and self.ms3a.set_base_pubkey(pub, index):
             # key exchange is complete; start by sending msg1
             print("Key exchange complete")
             print("Address to fund is: ", self.ms3a.get_musig_address())

@@ -5,7 +5,7 @@ import jmbitcoin
 import os
 import sys
 from hashlib import sha256
-from typing import Tuple
+from typing import Tuple, List
 from bitcointx.wallet import CCoinKey
 from bitcointx.core import CTxOut, CMutableTransaction
 from bitcointx.core.script import SignatureHashSchnorr
@@ -55,29 +55,32 @@ For a full debate/discussion see https://github.com/jonasnick/bips/issues/32
 
 
 def its_not_ok_to_be_odd_in_bip340(point: CPubKey,
-                    scalar: bytes) -> Tuple[bytes, bool]:
+                    scalars: List[bytes]) -> Tuple[bytes, bool]:
     """ Pass a point in compressed form (CPubKey object),
-    (note, not XOnlyPubKey), and pass *a* corresponding
-    scalar (private key as bytes) object - flip the sign of
-    the latter, if the former has odd y coord.
-    (Note "a" because in aggregation scenarios, the private
-    key whose sign must be flipped may not be the private key
-    of the point `point`.)
-    The updated scalar is returned and should be used to reset.
+    (note, not XOnlyPubKey), and pass a list of corresponding
+    scalars (private keys as bytes) - flip the sign of
+    the latters, if the former has odd y coord.
+    The updated scalars are returned and should be used to reset.
     """
     sign_flipped = False
+    newscalars = []
     if bytes(point)[0] == 3:
-        xi = int_from_bytes(scalar)
-        xie = GROUPN - xi
-        scalar = bytes_from_int(xie)
+        for scalar in scalars:
+            xi = int_from_bytes(scalar)
+            xie = GROUPN - xi
+            newscalars.append(bytes_from_int(xie))
         sign_flipped = True
-    return scalar, sign_flipped
+    else:
+        newscalars = scalars
+    return newscalars, sign_flipped
 
 def flip_pubkey_sign(point: CPubKey) -> CPubKey:
     """ In case we needed to flip signs of any input keys to the algorithm,
     in order to get a valid x-only signing event, we may also need to flip
     signs of public keys that do not belong to us, in order to do verification
     of the data sent to us by counterparties.
+    (NB: Flipping "sign" (in finite field treat x>n/2 as "negative"),
+    # is the same as flipping y-coord parity because group order is odd)
     """
     signbyte = bytes(point)[0]
     if signbyte == 3:
@@ -175,7 +178,8 @@ class MS3A(object):
         """
         self.keys[index] = key
         if all(self.keys):
-            self.get_agg_P()
+            if not self.agg_P:
+                self.get_agg_P()
             return True
         return False
 
@@ -212,9 +216,8 @@ class MS3A(object):
         if not self.Rs[self.myindex]:
             self.set_my_nonce()
         if not self.adaptor_secret:
-            self.set_adaptor_secret(os.urandom(32))
-            self.Ts[self.myindex] = CCoinKey.from_secret_bytes(
-                self.adaptor_secret).pub
+            self.Ts[self.myindex] = bytes([0])
+            self.HTs[self.myindex] = self.hashfn(self.Ts[self.myindex]).digest()
 
         return (self.hashfn(bytes(self.Rs[self.myindex])).digest(),
                 self.hashfn(bytes(self.Ts[self.myindex])).digest())
@@ -230,7 +233,10 @@ class MS3A(object):
         return (self.Rs[self.myindex], self.Ts[self.myindex])
 
     def verify_ms3a_msg_2(self, i: int, R: CPubKey,
-                          T: CPubKey) -> bool:
+                          T: bytes) -> bool:
+        # Note we receive `T` as bytes, since optionally it can be a
+        # null message consisting of a single zero byte, which is not a valid
+        # CPubKey
         tempHR, tempHT = [self.hashfn(bytes(x)).digest() for x in [R, T]]
         return (tempHR == self.HRs[i] and tempHT == self.HTs[i])
 
@@ -240,7 +246,10 @@ class MS3A(object):
             self.Ts[i] = T
         else:
             # The R, T values can only be accepted if they match the pre-existing
-            # hashes that were sent, for the same index.            
+            # hashes that were sent, for the same index.
+            print("Aborting because received step 2 message was invalid for index: {}".format(i))
+            print("Here are current R values: ")
+            print(self.Rs)
             self.state = MS3A_ABORTED
             return False
         if all(self.Rs):
@@ -258,6 +267,7 @@ class MS3A(object):
 
     def receive_ms3a_msg_3(self, partial_sig: bytes, index: int) -> bool:
         if not self.verify_partial_sig(partial_sig, index):
+            print("Partial sig verify failed at index {}".format(index))
             self.state = MS3A_ABORTED
             return False
         self.fullpartials[index] = partial_sig
@@ -286,17 +296,28 @@ class MS3A(object):
             self.full_signature):
             print("Failed to verify the aggregated signature")
             return False
-
         return True
 
     def get_agg_R(self):
-        """ Sets aggregate nonce using compressed points,
-        and deduces whether the base nonce sign needs to be
-        flipped, depending on the aggregate's parity.
+        """ Sets aggregate nonce using compressed points
         """
         self.agg_R = jmbitcoin.add_pubkeys(self.Rs)
-        self.basenonce, x = its_not_ok_to_be_odd_in_bip340(
-            self.agg_R, self.basenonce)
+        self.reset_base_nonce_with_aggR()
+
+    def reset_base_nonce_with_aggR(self, include_t: bool =False):
+        """deduces whether the base nonce sign, for this
+        participant, needs to be flipped, depending on the aggregate
+        nonce's parity.
+        """
+        scalarlist = [self.basenonce]
+        if include_t:
+            scalarlist.append(self.adaptor_secret)
+        newscalarlist, x = its_not_ok_to_be_odd_in_bip340(
+            self.agg_R, scalarlist)
+        self.basenonce = newscalarlist[0]
+        print("In reset base nonce, self.basenonce set to: ", self.basenonce)
+        if include_t:
+            self.adaptor_secret = newscalarlist[1]
         self.nonce_sign_flipped = x
 
     def set_keyset_str(self):
@@ -311,12 +332,15 @@ class MS3A(object):
         for k in self.keys:
             self.keysetstr += bytes(k)
 
-    def get_partial_signature(self) -> bytes:
+    def get_partial_signature(self, include_t: bool = True) -> bytes:
         """ Returns partial signature in the form:
-        s_i = k_i + H(R,P,m)H(L||P_i)x_i for this participant,
+        s_i = k_i (+t_i) + H(R (+T),P,m)H(L||P_i)x_i for this participant,
         and can only be calculated after the first two rounds are completed
         by all participants, so we know the full (and sign flipped)
         aggregate nonce.
+        Note that: returning a signature *adaptor* is functionally identical
+        to returning a partial, without including the secret t_i, in cases where
+        the secret t_i *is* defined.
         """
         # Must only be attempted once the first two rounds are completed
         # by all the participants.
@@ -332,22 +356,35 @@ class MS3A(object):
         xonlyaggP = btc.core.key.XOnlyPubKey(self.agg_P)
         e = int_from_bytes(bip340_signing_hash(bytes(xonlyaggR),
                             bytes(xonlyaggP), self.sighash)) % GROUPN
-        # s = k + ex:
+        # s = k + ex, or k + t + ex where needed:
         sig = (my_nonce_int + e * agg_priv_int) % GROUPN
+        if self.adaptor_secret and include_t:
+            adaptor_int = int_from_bytes(self.adaptor_secret)
+            sig = (sig + adaptor_int) % GROUPN
+        if not include_t:
+            # We don't set the partial signature, if we're returning
+            # an adaptor (the only reason to set include_t = False)
+            return sig
         self.fullpartials[self.myindex] = bytes_from_int(sig)
         return sig
 
-    def verify_partial_sig(self, partial_sig: bytes, index: int):
+    def verify_partial_sig(self, partial_sig: bytes, index: int,
+                           include_t: bool = True):
         """ Given a partial sig s_i = k_i + H(..)x_agg_i , check if it
         Schnorr verifies (so that sigma(s_i) will verify with same sighash).
         Note we must flip signs of locally stored R partials, and P partials,
         if and only if (for each, separately), we have flipped the sign of
         the corresponding aggregate key.
+        We also include the T value corresponding to index index, if it is set,
+        into sG =?= R + T + eP (with e hashing the aggR including all Ts).
         """
-        LHS = jmbitcoin.privkey_to_pubkey(partial_sig + b"\x01")
+        LHS = jmbitcoin.privkey_to_pubkey(partial_sig + b"\x01") # LHS=sG
         R = self.Rs[index]
+        T = self.Ts[index]
         if self.nonce_sign_flipped:
             R = flip_pubkey_sign(R)
+            if T != bytes([0]) and include_t:
+                T = flip_pubkey_sign(T)
         # x-only forms of keys are required for consensus:
         xonlyaggR = btc.core.key.XOnlyPubKey(self.agg_R)
         xonlyaggP = btc.core.key.XOnlyPubKey(self.agg_P)        
@@ -356,31 +393,24 @@ class MS3A(object):
         if self.key_sign_flipped:
             P = flip_pubkey_sign(P)
         eP = jmbitcoin.multiply(e, P, return_serialized=False)
-        return LHS == jmbitcoin.add_pubkeys([R, eP])
- 
-    """ Adaptor code. TODO.
+        RT = R
+        if T != bytes([0]) and include_t:
+            RT = jmbitcoin.add_pubkeys([RT, T])
+        return LHS == jmbitcoin.add_pubkeys([RT, eP])
 
-    def get_adaptor_from_secret(self) -> bytes:
-        T = jmbitcoin.privkey_to_pubkey(self.adaptor_secret + b"\x01")
-        # see note on raw arithmetic in MS3A.get_partial_signature:
-        agg_priv_int = int_from_bytes(self.agg_privkey)
-        my_nonce_int = int_from_bytes(self.basenonce)
-        # x-only forms of keys are required for consensus:
-        agg_R_plus_T = jmbitcoin.add_pubkeys([self.agg_R, T])
-        xonlyaggRT = btc.core.key.XOnlyPubKey(agg_R_plus_T)
-        xonlyaggP = btc.core.key.XOnlyPubKey(self.agg_P)
-        e = int_from_bytes(bip340_signing_hash(bytes(xonlyaggRT),
-                        bytes(xonlyaggP), self.sighash)) % GROUPN
-        # s' = k + e * x_agg, where e is H(Ragg + T||Pagg||m) s.t. s = s' + t:
-        sigprimeint = (my_nonce_int + e * agg_priv_int) % GROUPN
-        return bytes_from_int(sigprimeint)
+    def verify_adaptor(self, signature_adaptor: bytes,
+                       adaptor_point: bytes, keyindex: int):
+        """ Note that this is far from a fully-general
+        'verify that this adaptor, for this message and key, is valid
+        and implies revelation once the signature is revealed'. Here,
+        we have set up the m, P, T and R values in advance, and are only
+        checking that this s' works for this context.
+        """
+        assert self.Ts[keyindex] != bytes([0])
+        assert self.state >= MS3A_STATE_NONCES_EXCHANGED
+        return self.verify_partial_sig(signature_adaptor,
+                                       keyindex, include_t=False)
 
-    def verify_adaptor(self, signature_adaptor: bytes, adaptor_point: bytes, keyindex: int):
-        adaptor_point_for_schnorr = lift_x(adaptor_point)
-        pubkey = self.get_agg_P_i(keyindex)
-        return schnorr_verify_adaptor(self.sighash, pubkey, signature_adaptor, adaptor_point_for_schnorr)
-    """
-        
     def get_agg_P_i(self, i: int) -> CPubKey:
         """ Sets the aggregate pubkey component for index i.
         additionally, sets the 'aggregate privkey' for *this* index,
@@ -413,13 +443,51 @@ class MS3A(object):
         for i in range(self.n):
             xvals.append(self.get_agg_P_i(i))
         self.agg_P = jmbitcoin.add_pubkeys(xvals)
-        self.agg_privkey, x = its_not_ok_to_be_odd_in_bip340(
-            self.agg_P, self.agg_privkey)
+        agg_privkeylist, x = its_not_ok_to_be_odd_in_bip340(
+            self.agg_P, [self.agg_privkey])
+        self.agg_privkey = agg_privkeylist[0]
         self.key_sign_flipped = x
         self.state = MS3A_STATE_KEYAGG_COMPLETE
         # we now have an address:
         self.get_musig_address()
         return self.agg_P, self.musig_address
+
+class AdaptorizedMS3A(MS3A):
+    """ Include adaptor in MS3A process control.
+    Includes ability to derive a "signature adaptor", once
+    nonces are exchanged (i.e. first two rounds complete).
+    Note that passing of adaptor *points* is *always* included
+    in MS3A first two rounds; if they are not needed, they are set
+    to 1-byte 0 strings, and then ignored in signing steps.
+    """
+    def __init__(self, privkey: btc.core.key.CKey,
+                 adaptor_secret: bytes,
+                n: int, myindex: int, hashfn = sha256):
+        super().__init__(privkey, n, myindex, hashfn)
+        """ Note that an adaptor secret is a required argument;
+        if there isn't one, just create a MS3A object instead.
+        """
+        assert len(adaptor_secret) == 32
+        self.adaptor_secret = adaptor_secret
+        # sets T and the hash of T as commitment:
+        self.set_adaptor_secret(self.adaptor_secret)
+
+    def get_agg_R(self):
+        """ In adaptor-including signing, we must include
+        any and all non-empty T values into the aggregated nonce.
+        """
+        real_Ts = [CPubKey(x) for x in self.Ts if x != bytes([0])]
+        self.agg_R = jmbitcoin.add_pubkeys(self.Rs + real_Ts)
+        self.reset_base_nonce_with_aggR(include_t=True)
+
+    def get_signature_adaptor(self) -> bytes:
+        """ see note on raw arithmetic in MS3A.get_partial_signature.
+        Also, note that this can only occur after full nonce exchange
+        (i.e. messages 1 and 2), since only then do we know the correct
+        signs for the x-only flips.
+        """
+        assert self.state >= MS3A_STATE_NONCES_EXCHANGED
+        return self.get_partial_signature(include_t=False)
 
 def test_musig_with_n_keys(n, deterministic):
     # 1. Keys and MuSig context objects created.
