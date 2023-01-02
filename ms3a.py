@@ -299,10 +299,13 @@ class MS3A(object):
         return True
 
     def get_agg_R(self):
-        """ Sets aggregate nonce using compressed points
+        """ In adaptor-including signing, we must include
+        any and all non-empty T values into the aggregated nonce.
         """
-        self.agg_R = jmbitcoin.add_pubkeys(self.Rs)
-        self.reset_base_nonce_with_aggR()
+        real_Ts = [CPubKey(x) for x in self.Ts if x != bytes([0])]
+        self.agg_R = jmbitcoin.add_pubkeys(self.Rs + real_Ts)
+        include_t = True if self.adaptor_secret else False
+        self.reset_base_nonce_with_aggR(include_t=include_t)
 
     def reset_base_nonce_with_aggR(self, include_t: bool =False):
         """deduces whether the base nonce sign, for this
@@ -315,7 +318,6 @@ class MS3A(object):
         newscalarlist, x = its_not_ok_to_be_odd_in_bip340(
             self.agg_R, scalarlist)
         self.basenonce = newscalarlist[0]
-        print("In reset base nonce, self.basenonce set to: ", self.basenonce)
         if include_t:
             self.adaptor_secret = newscalarlist[1]
         self.nonce_sign_flipped = x
@@ -361,15 +363,16 @@ class MS3A(object):
         if self.adaptor_secret and include_t:
             adaptor_int = int_from_bytes(self.adaptor_secret)
             sig = (sig + adaptor_int) % GROUPN
+        sig_bytes = bytes_from_int(sig)
         if not include_t:
             # We don't set the partial signature, if we're returning
             # an adaptor (the only reason to set include_t = False)
-            return sig
-        self.fullpartials[self.myindex] = bytes_from_int(sig)
-        return sig
+            return sig_bytes
+        self.fullpartials[self.myindex] = sig_bytes
+        return sig_bytes
 
     def verify_partial_sig(self, partial_sig: bytes, index: int,
-                           include_t: bool = True):
+                           include_t: bool = True) -> bool:
         """ Given a partial sig s_i = k_i + H(..)x_agg_i , check if it
         Schnorr verifies (so that sigma(s_i) will verify with same sighash).
         Note we must flip signs of locally stored R partials, and P partials,
@@ -398,8 +401,16 @@ class MS3A(object):
             RT = jmbitcoin.add_pubkeys([RT, T])
         return LHS == jmbitcoin.add_pubkeys([RT, eP])
 
-    def verify_adaptor(self, signature_adaptor: bytes,
-                       adaptor_point: bytes, keyindex: int):
+    def get_signature_adaptor(self) -> bytes:
+        """ see AdaptorizedMS3A.get_signature_adaptor.
+        This is a null message (easier for message exchange,
+        if all send all).
+        """
+        assert self.state >= MS3A_STATE_NONCES_EXCHANGED
+        # Non existent by default
+        return bytes([0])
+
+    def verify_adaptor(self, signature_adaptor: bytes, keyindex: int) -> bool:
         """ Note that this is far from a fully-general
         'verify that this adaptor, for this message and key, is valid
         and implies revelation once the signature is revealed'. Here,
@@ -410,6 +421,23 @@ class MS3A(object):
         assert self.state >= MS3A_STATE_NONCES_EXCHANGED
         return self.verify_partial_sig(signature_adaptor,
                                        keyindex, include_t=False)
+
+    def reveal_adaptor_secret(self, signature_adaptor: bytes, keyindex: int) -> bytes:
+        assert self.state >= MS3A_STATE_FULLY_SIGNED
+        if self.Ts[keyindex] == bytes([0]):
+            return bytes([0])
+        assert len(signature_adaptor) == 32
+        # fullpartials must all exist if we reached fully signed:
+        fpint = int_from_bytes(self.fullpartials[keyindex])
+        saint = int_from_bytes(signature_adaptor)
+        secret = (fpint - saint) % GROUPN
+        bsecret = bytes_from_int(secret)
+        test_pubkey = jmbitcoin.privkey_to_pubkey(bsecret + b"\x01")
+        if self.nonce_sign_flipped:
+            test_pubkey = flip_pubkey_sign(test_pubkey)
+        # failure of this assertion means a cryptographic break:
+        assert test_pubkey == self.Ts[keyindex]
+        return bsecret
 
     def get_agg_P_i(self, i: int) -> CPubKey:
         """ Sets the aggregate pubkey component for index i.
@@ -471,14 +499,6 @@ class AdaptorizedMS3A(MS3A):
         self.adaptor_secret = adaptor_secret
         # sets T and the hash of T as commitment:
         self.set_adaptor_secret(self.adaptor_secret)
-
-    def get_agg_R(self):
-        """ In adaptor-including signing, we must include
-        any and all non-empty T values into the aggregated nonce.
-        """
-        real_Ts = [CPubKey(x) for x in self.Ts if x != bytes([0])]
-        self.agg_R = jmbitcoin.add_pubkeys(self.Rs + real_Ts)
-        self.reset_base_nonce_with_aggR(include_t=True)
 
     def get_signature_adaptor(self) -> bytes:
         """ see note on raw arithmetic in MS3A.get_partial_signature.
