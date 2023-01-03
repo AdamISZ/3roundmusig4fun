@@ -37,9 +37,13 @@ What about the multisig address? Taproot changed what addresses mean in a pretty
 Using MuSig is using the former. So we set, here, the script to `""`, i.e. deliberately unsatisfiable empty script, so script path spending isn't possible, and we make $P$ be the aggregated public key, negotiated by the MuSig code. More on this below.
 
 <a name="adaptors" />
+
 ### Adaptors
 
-TODO. I will add some explanation here when I add in code to actually do adaptors.
+Pass a third command line argument, currently just binary (1/0) to say whether *this* participant is going to include an adaptor secret into the signature. For any participant that does this, they will be sending to their counterparts, before receiving partial signatures, a *signature adaptor* that promises to reveal the discrete log of a point (or public key) `T`, deducible by subtraction, from the full partial signature of this participant. The preceding is probably nearly unintelligible if you haven't already studied signature adaptors. For a full-ish treatment of how *this* code is using adaptors, see my blog post [here](https://reyify.com/blog/multiparty-s6). For a more general description of what they are, see [this](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki#adaptor-signatures).
+
+( *As you can see, my 'campaign' to rename them signature adaptors, and not adaptor signatures, has been spectacularly unsuccessful. The latter name is dangerous because they are categorically not signatures; you do not need a private key to create one.*)
+
 
 ## Installing dependencies
 
@@ -81,10 +85,12 @@ https://github.com/AdamISZ/3roundmusig4fun/blob/a9c4989f1845e4166f04c896c1e5cb97
 * Run `N` instances of `musigparticipant.py` (3 seems a good start), like this:
 
 ```
-(jmvenv)$ python musigparticipant.py 0 3
+(jmvenv)$ python musigparticipant.py 0 3 0
 ```
 
 replacing `0` with `1`, `2`, in different terminals. They will all connect to each other (they talk to each other on random ports), then negotiate an aggregated pubkey after a short delay. Once that happens, they'll all show you the same funding address for the multisig (it will be a taproot address like `tb1p..` or `bcrt1p..`).
+
+(For explanation of the third command line argument, see above about 'adaptors'.)
 
 * Fund the address and enter the funding details
 
