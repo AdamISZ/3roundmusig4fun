@@ -4,7 +4,7 @@ import json
 from binascii import hexlify, unhexlify
 from typing import Tuple, Callable
 from ms3a import (MS3A, AdaptorizedMS3A, MS3A_STATE_NONCES_EXCHANGED,
-                  MS3A_STATE_FULLY_SIGNED, DETERMINISTIC_TEST)
+                  MS3A_STATE_FULLY_SIGNED, DETERMINISTIC_TEST, GROUPN)
 from twisted.protocols import basic
 from twisted.internet import reactor, protocol, task, endpoints
 from bitcointx.core.key import CKey, CPubKey
@@ -13,7 +13,7 @@ from bitcointx.core import (CTxOut, CMutableTransaction,
 from bitcointx.wallet import P2TRCoinAddress, CCoinAddress
 from bitcointx.core.script import CScriptWitness
 from jmbitcoin import human_readable_transaction
-
+from bip340schnorr import bytes_from_int, int_from_bytes
 port_base = 61529
 hostname = "localhost"
 
@@ -74,6 +74,12 @@ class MS3AManager(object):
             self.ms3a = MS3A(self.privkey, n, myindex)
         else:
             self.ms3a = AdaptorizedMS3A(self.privkey, ouradaptor, n, myindex)
+        self.msg_callbacks = {1: self.receive_key_exchange,
+                              2: self.receive_funding_notification,
+                              3: self.receive_commitments,
+                              4: self.receive_nonces,
+                              5: self.receive_partial,
+                              6: self.receive_signature_adaptor}
         # boolean lets us kick off process only once
         self.kicked_off = False
         # managing outbound connections:
@@ -203,8 +209,8 @@ class MS3AManager(object):
         update the right set of keys, nonces, sigs etc.
         """
         msgtype = message.msgtype
-        if msgtype in msg_callbacks.keys():
-            msg_callbacks[msgtype](message)
+        if msgtype in self.msg_callbacks.keys():
+            self.msg_callbacks[msgtype](message)
             return
     
     def receive_key_exchange(self, msg: MS3AMessage) -> None:
@@ -319,15 +325,22 @@ class MS3AManager(object):
         if self.ms3a.state == MS3A_STATE_FULLY_SIGNED:
             print("We have a full transaction signature: ")
             print(hexlify(self.ms3a.full_signature))
+            adaptor_secrets = []
             for i in range(self.n):
                 if i == self.myindex:
                     continue
                 if not self.ms3a.Ts[i] or self.ms3a.Ts[i] == bytes([0]):
                     continue
-                adaptor_secret = self.ms3a.reveal_adaptor_secret(self.sig_adaptors[i], i)
+                adaptor_secrets.append(self.ms3a.reveal_adaptor_secret(
+                    self.sig_adaptors[i], i))
                 print("After signing we got the secret value: {} "
                       "for index {} corresponding to point: {}".format(
-                          hexlify(adaptor_secret), i, self.ms3a.Ts[i]))
+                          hexlify(adaptor_secrets[-1]), i, self.ms3a.Ts[i]))
+            if len(adaptor_secrets) > 0:
+                self.aggregated_adaptor_secret = bytes_from_int(sum(
+                    [int_from_bytes(x) for x in adaptor_secrets]) % GROUPN)
+                print("We got an aggregated adaptor secret of: ",
+                      hexlify(self.aggregated_adaptor_secret))
             if self.myindex == 0:
                 print("Attempting to broadcast.")
                 self.broadcast_spend()
@@ -495,12 +508,6 @@ if include_adaptor != 0:
 x = MS3AManager(CKey.from_secret_bytes(oursecret), ncounterparties,
                 myindex, ouradaptor=ouradaptor)
 my_port = port_base + myindex
-msg_callbacks = {1: x.receive_key_exchange,
-        2: x.receive_funding_notification,
-        3: x.receive_commitments,
-        4: x.receive_nonces,
-        5: x.receive_partial,
-        6: x.receive_signature_adaptor}
 
 if ouradaptor:
     x.ms3a.set_adaptor_secret(ouradaptor)
