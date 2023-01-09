@@ -20,6 +20,15 @@ hostname = "localhost"
 class MS3AMessage(object):
     """ Encapsulates the messages passed over the wire
     to and from other onion peers
+    Simple message syntax:
+    json of three keys 'context', 'type', 'line'.
+    Type is as per `msg_callbacks` in MS3AManager.
+    Context is an integer allowing to differentiate multiple
+    communications for the signing of different transactions, at once.
+    Line is of this syntax:
+    counterparty_index:val,val,..
+    The `val`s are keys, sigs etc. All hex encoded.
+    The index must be an integer, then colon, then comma separated `val`s.
     """
     def __init__(self, signing_context: int, index: int,
                  vals: Tuple[str], msgtype: int):
@@ -60,31 +69,65 @@ class MS3AMessage(object):
 
 class MS3AParticipant(object):
     """ Representing 1 party in N x (N of N MuSig) operations,
-    this object manages the network interaction between this
-    participant and the other participants, and owns a set of
-    MS3AManager objects which manage a single signing context,
-    here N of them.
+    this object:
+    - owns the secret keys, of which there are N
+    - owns the single adaptor secret
+    - owns N MS3AManager objects which manage
+    a single signing context with the other participants
+    - manages the network interaction between this
+    participant and the other participants
     """
-    def __init__(self, privkey: CKey, n: int, myindex: int,
+    def __init__(self, privkeys: Tuple[CKey], n: int, myindex: int,
                  scindex_max: int, ouradaptor: bytes=b""):
         self.myindex = myindex
+        self.n = n
         self.signing_contexts = []
         self.scindex_max = scindex_max
+
+        # these manage instantiation of network communication
+        # protocols, see MS3AProtocol
         self.factories = {}
         for k in range(scindex_max):
             self.signing_contexts.append(MS3AManager(
-                privkey, n, myindex, k,ouradaptor=ouradaptor,
-            send_callback=self.send))
+                privkeys[k], n, myindex, k,
+                ouradaptor=ouradaptor,
+                send_callback=self.send,
+                adaptor_safety_callback=self.check_adaptor_consistency))
+
+        # For our use case, all signing contexts will
+        # use an adaptor, and it will be the same one
+        self.set_adaptor_secret(ouradaptor)
+
         for i in range(n):
             if i == self.myindex:
                 continue
             port_to_use = port_base + i
             self.connect(i, port_to_use)
+
         reactor.callLater(10.0, self.start_key_exchange)
 
     def set_adaptor_secret(self, secret:bytes):
         for s in self.signing_contexts:
             s.ms3a.set_adaptor_secret(secret)
+
+    def check_adaptor_consistency(self) -> bool:
+        """ This should be called *before* sending
+        partial signatures, in order to ensure safety
+        of receipt of adaptor secrets on full signatures.
+        """
+        Tchecks = {}
+        for s in self.signing_contexts:
+            for i in range(self.n):
+                if i == self.myindex:
+                    continue
+                if i in Tchecks:
+                    if s.ms3a.Ts[i] != Tchecks[i]:
+                        print("Mismatch on adaptors, aborting: {}, {}".format(
+                            s.ms3a.Ts[i], Tchecks[i]))
+                        return False
+                    else:
+                        Tchecks[i] = s.ms3a.Ts[i]
+        return True
 
     def start_key_exchange(self):
         if not self.myindex == 0:
@@ -131,15 +174,10 @@ class MS3AParticipant(object):
             message)
 
 class MS3AManager(object):
-    """ Simple message syntax:
-    json of two keys 'type', 'line'. Type is as per `msg_callbacks` above.
-    Line is of this syntax:
-    counterparty_index:val,val,..
-    The `val`s are keys, sigs etc. All hex encoded.
-    The index must be an integer, then colon, then comma separated `val`s.
-    """
+
     def __init__(self, privkey: CKey, n: int, myindex: int, scindex: int,
-                 send_callback: Callable, ouradaptor: bytes=b""):
+                 send_callback: Callable, adaptor_safety_callback: Callable,
+                 ouradaptor: bytes=b""):
         # create a private key and public key, then
         # be ready to receive messages.
         self.privkey = privkey
@@ -159,6 +197,7 @@ class MS3AManager(object):
                               4: self.receive_nonces,
                               5: self.receive_partial,
                               6: self.receive_signature_adaptor}
+        self.adaptor_safety_callback = adaptor_safety_callback
         # boolean lets us kick off process only once
         self.kicked_off = False
         self.send_callback = send_callback
@@ -409,6 +448,10 @@ class MS3AManager(object):
         # We only care about *others'* sig adaptors, not our own (null or not):
         sig_adaptors_to_check = self.sig_adaptors[:myindex] + self.sig_adaptors[myindex+1:]
         if all(sig_adaptors_to_check):
+            if not self.adaptor_safety_callback():
+                print("Not sending partial signatures; adaptors "
+                      "in different signing contexts don't match.")
+                return
             # Having received all makes us safe to send, since
             # any secrets we need, we will now know:
             print("We have received all sig adaptor messages, "
@@ -549,25 +592,25 @@ class MS3AClientFactory(protocol.ReconnectingClientFactory):
 
 myindex = int(sys.argv[1])
 
-if DETERMINISTIC_TEST:
-    oursecret = bytes([myindex+1]*32)
-else:
-    oursecret = os.urandom(32)
 ncounterparties = int(sys.argv[2])
-include_adaptor = int(sys.argv[3])
-ouradaptor = b""
-if include_adaptor != 0:
-    if DETERMINISTIC_TEST:
-        ouradaptor = bytes([myindex+27]*32)
-    else:
-        ouradaptor = os.urandom(32)
 
-x = MS3AParticipant(CKey.from_secret_bytes(oursecret), ncounterparties,
-                myindex, ncounterparties, ouradaptor=ouradaptor)
+if DETERMINISTIC_TEST:
+    oursecrets = [bytes([myindex+1+q]*32) for q in range(ncounterparties)]
+else:
+    oursecrets = [os.urandom(32) for _ in range(ncounterparties)]
+
+include_adaptor = int(sys.argv[3])
+
+if DETERMINISTIC_TEST:
+    ouradaptor = bytes([myindex+47]*32)
+else:
+    ouradaptor = os.urandom(32)
+
+x = MS3AParticipant([CKey.from_secret_bytes(s) for s in oursecrets],
+                    ncounterparties, myindex, ncounterparties,
+                    ouradaptor=ouradaptor)
 my_port = port_base + myindex
 
-if ouradaptor:
-    x.set_adaptor_secret(ouradaptor)
 # The spending transaction will be processed from a file:
 for sc in x.signing_contexts:
     task.LoopingCall(sc.check_for_funding).start(2.0)
