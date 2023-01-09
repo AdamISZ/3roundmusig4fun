@@ -21,13 +21,16 @@ class MS3AMessage(object):
     """ Encapsulates the messages passed over the wire
     to and from other onion peers
     """
-    def __init__(self, index: int, vals: Tuple[str], msgtype: int):
+    def __init__(self, signing_context: int, index: int,
+                 vals: Tuple[str], msgtype: int):
+        self.signing_context = signing_context
         self.text = str(index) + ":" + ",".join(vals)
         self.msgtype = msgtype
 
     def encode(self) -> bytes:
-        self.encoded = json.dumps({"type": self.msgtype,
-                        "line": self.text}).encode("utf-8")
+        self.encoded = json.dumps({"context": self.signing_context,
+                                   "type": self.msgtype,
+                                   "line": self.text}).encode("utf-8")
         return self.encoded
 
     def get_vals(self):
@@ -43,6 +46,7 @@ class MS3AMessage(object):
         """
         try:
             msg_obj = json.loads(msg)
+            signing_context = msg_obj["context"]
             text = msg_obj["line"]
             msgtype = msg_obj["type"]
             assert isinstance(msgtype, int)
@@ -52,7 +56,79 @@ class MS3AMessage(object):
         except:
             print("Error decoding message")
             raise
-        return cls(index, vals, msgtype)
+        return cls(signing_context, index, vals, msgtype)
+
+class MS3AParticipant(object):
+    """ Representing 1 party in N x (N of N MuSig) operations,
+    this object manages the network interaction between this
+    participant and the other participants, and owns a set of
+    MS3AManager objects which manage a single signing context,
+    here N of them.
+    """
+    def __init__(self, privkey: CKey, n: int, myindex: int,
+                 scindex_max: int, ouradaptor: bytes=b""):
+        self.myindex = myindex
+        self.signing_contexts = []
+        self.scindex_max = scindex_max
+        self.factories = {}
+        for k in range(scindex_max):
+            self.signing_contexts.append(MS3AManager(
+                privkey, n, myindex, k,ouradaptor=ouradaptor,
+            send_callback=self.send))
+        for i in range(n):
+            if i == self.myindex:
+                continue
+            port_to_use = port_base + i
+            self.connect(i, port_to_use)
+        reactor.callLater(10.0, self.start_key_exchange)
+
+    def set_adaptor_secret(self, secret:bytes):
+        for s in self.signing_contexts:
+            s.ms3a.set_adaptor_secret(secret)
+
+    def start_key_exchange(self):
+        if not self.myindex == 0:
+            return
+        for i in range(0, self.scindex_max):
+            self.signing_contexts[i].start_key_exchange()
+
+    def register_connection(self):
+        self.able_to_send = True
+
+    def register_disconnection(self):
+        self.able_to_send = False
+
+    def connect(self, index: int, port: int) -> None:
+        if index in self.factories:
+            return
+        self.factories[index] = MS3AClientFactory(self.receive_message,
+        self.register_connection, self.register_disconnection)
+        print("{} is making a tcp connection to {}, {}".format(
+            self.myindex, index, port))
+        self.tcp_connector = reactor.connectTCP(hostname, port,
+                                                self.factories[index])
+
+    def send(self, counterparty_index: int, msg: MS3AMessage):
+        res = self.factories[counterparty_index].send(msg)
+        if not res:
+            print("Failed to send to {}, message was: {}".format(
+                counterparty_index, msg.text))
+
+    def receive_message(self, message: MS3AMessage):
+        """ This sends the message to the right callback,
+        dependent on the message type. Note that this code,
+        being only for toy/test cases, doesn't bother to
+        pay attention to network source, just trusts the
+        counterparty to be sending a consistent index to
+        update the right set of keys, nonces, sigs etc.
+        """
+        # Just ignore all messages that don't specify our
+        # signing context
+        if message.signing_context not in range(self.scindex_max):
+            print("Invalid signing context index: ", message)
+            return
+        self.signing_contexts[message.signing_context].receive_message(
+            message)
 
 class MS3AManager(object):
     """ Simple message syntax:
@@ -62,13 +138,16 @@ class MS3AManager(object):
     The `val`s are keys, sigs etc. All hex encoded.
     The index must be an integer, then colon, then comma separated `val`s.
     """
-    def __init__(self, privkey: CKey, n: int, myindex: int, ouradaptor: bytes=b""):
+    def __init__(self, privkey: CKey, n: int, myindex: int, scindex: int,
+                 send_callback: Callable, ouradaptor: bytes=b""):
         # create a private key and public key, then
         # be ready to receive messages.
         self.privkey = privkey
+        # number of counterparties
         self.n = n
         self.myindex = myindex
         assert myindex < n
+        self.scindex = scindex
         # the signing state is encapsulated here:
         if ouradaptor == b"":
             self.ms3a = MS3A(self.privkey, n, myindex)
@@ -82,18 +161,11 @@ class MS3AManager(object):
                               6: self.receive_signature_adaptor}
         # boolean lets us kick off process only once
         self.kicked_off = False
-        # managing outbound connections:
-        self.factories = {}
+        self.send_callback = send_callback
         self.funding_received = False
         self.able_to_send = False
         self.key_sent = False
         self.sig_adaptors = [None] * n
-        for i in range(self.n):
-            if i == self.myindex:
-                continue
-            port_to_use = port_base + i
-            self.connect(i, port_to_use)
-        reactor.callLater(10.0, self.start_key_exchange)
 
     def start_key_exchange(self):
         """ Arbitrarily, index 0 acts as coordinator,
@@ -112,7 +184,7 @@ class MS3AManager(object):
         if self.funding_received:
             return
         try:
-            with open("fundingfile" + str(self.myindex) + ".txt", "r") as f:
+            with open("fundingfile" + str(self.myindex) + str(self.scindex) + ".txt", "r") as f:
                 lines = f.readlines()
                 if len(lines) > 0:
                     print("We saw a line in the file: ", lines[0])
@@ -131,74 +203,54 @@ class MS3AManager(object):
             # ignore non-existence
             pass
 
+    def create_ms3a_message(self, data: Tuple[str], msgtype: int) -> MS3AMessage:
+        return MS3AMessage(self.scindex, self.myindex, data, msgtype)
+
+    def send(self, counterparty_index: int, msg: MS3AMessage):
+        self.send_callback(counterparty_index, msg)
+
     def send_key_exchange_message(self, index):
-        msg = MS3AMessage(self.myindex, (hexlify(self.ms3a.basepubkey).decode(),), 1)
-        res = self.factories[index].send(msg)
-        if not res:
-            print("Failed to send to {}, message was: {}".format(index, msg.text))
+        msg = self.create_ms3a_message((hexlify(self.ms3a.basepubkey).decode(),), 1)
+        self.send(index, msg)
 
     def send_commitment_exchange_message(self, index):
         self.ms3a.get_ms3a_msg_1()
-        msg = MS3AMessage(self.myindex,
-                          (hexlify(self.ms3a.HRs[self.myindex]).decode(),
-                           hexlify(self.ms3a.HTs[self.myindex]).decode()), 3)
-        res = self.factories[index].send(msg)
-        if not res:
-            print("Failed to send to {}, message was: {}".format(index, msg.text))
+        msg = self.create_ms3a_message((hexlify(
+            self.ms3a.HRs[self.myindex]).decode(),
+            hexlify(self.ms3a.HTs[self.myindex]).decode()), 3)
+        self.send(index, msg)
 
     def send_nonce_exchange_message(self, index):
-        msg = MS3AMessage(self.myindex,
-                          (hexlify(self.ms3a.Rs[self.myindex]).decode(),
-                           hexlify(self.ms3a.Ts[self.myindex]).decode()), 4)
-        res = self.factories[index].send(msg)
-        if not res:
-            print("Failed to send to {}, message was: {}".format(index, msg.text))
+        msg = self.create_ms3a_message((hexlify(
+            self.ms3a.Rs[self.myindex]).decode(),
+            hexlify(self.ms3a.Ts[self.myindex]).decode()), 4)
+        self.send(index, msg)
 
     def send_funding_message(self, index: int, hextxid: str, spending_index: int,
                              value: int, inaddress: str, valueout: int,
                              addrout: str):
-        msg = MS3AMessage(self.myindex, (hextxid,
-                                         str(spending_index),
-                                         str(value),
-                                         inaddress,
-                                         str(valueout),
-                                         addrout), 2)
+        msg = self.create_ms3a_message((hextxid,
+                                       str(spending_index),
+                                       str(value),
+                                       inaddress,
+                                       str(valueout),
+                                       addrout), 2)
         if index == self.myindex:
             self.receive_funding_notification(msg)
         else:
-            res = self.factories[index].send(msg)
-            if not res:
-                print("Failed to send to {}, message was: {}".format(index, msg.text))
+            self.send(index, msg)
 
     def send_partials_exchange_message(self, index):
-        msg = MS3AMessage(self.myindex,
-                          (hexlify(self.ms3a.fullpartials[self.myindex]).decode(),), 5)
-        res = self.factories[index].send(msg)
-        if not res:
-            print("Failed to send to {}, message was: {}".format(index, msg.text))        
+        msg = self.create_ms3a_message((hexlify(
+            self.ms3a.fullpartials[self.myindex]).decode(),), 5)
+        self.send(index, msg)
 
     def send_signature_adaptor_message(self, index: int) -> None:
-        msg = MS3AMessage(self.myindex,
-                          (hexlify(self.ms3a.get_signature_adaptor()).decode(),), 6)
-        res = self.factories[index].send(msg)
-        if not res:
-            print("Failed to send to {}, message was: {}".format(index, msg.text))
+        msg = self.create_ms3a_message((hexlify(
+            self.ms3a.get_signature_adaptor()).decode(),), 6)
+        self.send(index, msg)
 
-    def register_connection(self):
-        self.able_to_send = True
 
-    def register_disconnection(self):
-        self.able_to_send = False
-
-    def connect(self, index: int, port: int) -> None:
-        if index in self.factories:
-            return
-        self.factories[index] = MS3AClientFactory(self.receive_message,
-        self.register_connection, self.register_disconnection)
-        print("{} is making a tcp connection to {}, {}".format(
-            self.myindex, index, port))       
-        self.tcp_connector = reactor.connectTCP(hostname, port,
-                                                self.factories[index])
 
     def receive_message(self, message: MS3AMessage):
         """ This sends the message to the right callback,
@@ -208,6 +260,10 @@ class MS3AManager(object):
         counterparty to be sending a consistent index to
         update the right set of keys, nonces, sigs etc.
         """
+        # Just ignore all messages that don't specify our
+        # signing context
+        if message.signing_context != self.scindex:
+            return
         msgtype = message.msgtype
         if msgtype in self.msg_callbacks.keys():
             self.msg_callbacks[msgtype](message)
@@ -428,7 +484,7 @@ class MS3AFactory(protocol.ServerFactory):
     """
     protocol = MS3AProtocol
 
-    def __init__(self, client: 'MS3AManager'):
+    def __init__(self, client: 'MS3AParticipant'):
         self.client = client
 
     def receive_message(self, message: MS3AMessage,
@@ -505,15 +561,16 @@ if include_adaptor != 0:
         ouradaptor = bytes([myindex+27]*32)
     else:
         ouradaptor = os.urandom(32)
-x = MS3AManager(CKey.from_secret_bytes(oursecret), ncounterparties,
-                myindex, ouradaptor=ouradaptor)
+
+x = MS3AParticipant(CKey.from_secret_bytes(oursecret), ncounterparties,
+                myindex, ncounterparties, ouradaptor=ouradaptor)
 my_port = port_base + myindex
 
 if ouradaptor:
-    x.ms3a.set_adaptor_secret(ouradaptor)
+    x.set_adaptor_secret(ouradaptor)
 # The spending transaction will be processed from a file:
-funding_info_loop = task.LoopingCall(x.check_for_funding)
-funding_info_loop.start(2.0)
+for sc in x.signing_contexts:
+    task.LoopingCall(sc.check_for_funding).start(2.0)
 endpoints.serverFromString(reactor,
     "tcp:"+str(my_port)).listen(MS3AFactory(x))
 reactor.run()
