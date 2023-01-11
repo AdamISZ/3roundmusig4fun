@@ -40,10 +40,11 @@ Using MuSig is using the former. So we set, here, the script to `""`, i.e. delib
 
 ### Adaptors
 
-Pass a third command line argument, currently just binary (1/0) to say whether *this* participant is going to include an adaptor secret into the signature. For any participant that does this, they will be sending to their counterparts, before receiving partial signatures, a *signature adaptor* that promises to reveal the discrete log of a point (or public key) `T`, deducible by subtraction, from the full partial signature of this participant. The preceding is probably nearly unintelligible if you haven't already studied signature adaptors. For a full-ish treatment of how *this* code is using adaptors, see my blog post [here](https://reyify.com/blog/multiparty-s6). For a more general description of what they are, see [this](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki#adaptor-signatures).
+All participants will be sending to their counterparts, before receiving partial signatures, a *signature adaptor* that promises to reveal the discrete log of a point (or public key) `T`, deducible by subtraction, from the full partial signature of this participant. The preceding is probably nearly unintelligible if you haven't already studied signature adaptors. For a full-ish treatment of how *this* code is using adaptors, see my blog post [here](https://reyify.com/blog/multiparty-s6). For a more general description of what they are, see [this](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki#adaptor-signatures).
 
 ( *As you can see, my 'campaign' to rename them signature adaptors, and not adaptor signatures, has been spectacularly unsuccessful. The latter name is dangerous because they are categorically not signatures; you do not need a private key to create one.*)
 
+This is set up in such a way that each participant will use the *same* adaptor across multiple signing events, so that the revelation of the secret `t` value, from the broadcast of any one transaction, will allow the enforcement of all the other transactions. See 'running a test' below on how to do it. Or, if you just want to understand it, see the above mentioned blog post.
 
 ## Installing dependencies
 
@@ -85,16 +86,14 @@ https://github.com/AdamISZ/3roundmusig4fun/blob/a9c4989f1845e4166f04c896c1e5cb97
 * Run `N` instances of `musigparticipant.py` (3 seems a good start), like this:
 
 ```
-(jmvenv)$ python musigparticipant.py 0 3 0
+(jmvenv)$ python musigparticipant.py 0 3
 ```
 
 replacing `0` with `1`, `2`, in different terminals. They will all connect to each other (they talk to each other on random ports), then negotiate an aggregated pubkey after a short delay. Once that happens, they'll all show you the same funding address for the multisig (it will be a taproot address like `tb1p..` or `bcrt1p..`).
 
-(For explanation of the third command line argument, see above about 'adaptors'.)
-
 * Fund the address and enter the funding details
 
-To fund the address, use whatever wallet/code you choose. Then, in `fundingfile[i].txt`, enter these fields:
+To fund the address, use whatever wallet/code you choose. Then, in a file named `./fundingfile[i][j].txt`, (i, j explained in a moment) enter these fields:
 
 ```
 cc2829751a75cdc002b25ef897cae4987d5a71919a00e116f36265ac8a4f2769,0,508000,tb1pha7uk8tt9c0g4fwrlwvzmzc0jsa46shhx8uf9yhsat4zcz4y3ejqph2076,500000,tb1q3xr7l9nylsdlyqf9rkw0rg3f0yx6slguhtwpzp
@@ -102,9 +101,14 @@ cc2829751a75cdc002b25ef897cae4987d5a71919a00e116f36265ac8a4f2769,0,508000,tb1pha
 
 These are examples that I used on signet. The fields are: fundingtxid,funding-output-index,funding-output-amount,musig-address,amount-to-spend,destinationaddress.
 
+i: for now, keep it at 0; the 0th (first) participant will be the one reading this file as a trigger. j: this index is for the signing context. We explain that here:
+
+As per the design in the blog post above, we will have N transactions for N parties; each one will spend out of an N of N MuSig address, (let's set N=3 from here) each of those 3 addresses negotiated by the 3 parties. That means 3 executions of the MuSig protocol are done simultaneously, with each of the 3 parties generating 3 pubkeys (i.e. there are 9 pubkeys input to key exchange, in total). 3 spending-out transactions are being signed; 3 funding transactions must occur, paying *into* the 3 MuSig addresses. So, the index `j` deals with that: for this 3 party case, you'll want to create files fundingfile00.txt, fundingfile01.txt, fundingfile02.txt (doesn't matter what order they get created); each one will trigger the adaptor and signature exchange process for that individual signing context.
+
+Each participant only releases partial signatures once they're sure that the adaptor point `T` for each participant is fixed across the 3 signing contexts; it's that property that ensures that, if one spending transaction is broadcast, the other two can also be broadcast.
+
 Obviously this will be cleaned up a bit. The musigaddress is redundant (the code already knows it of course!), and it also only support a 1-in-1-out spend (but that seems fine just for testing).
 
-(Examples on chain don't show much, and that's kind of the point .. the spending utxo here is a simple p2tr keyspend; for these, the witness is just a single 64 byte Schnorr signature, as per the rules of BIP341.)
 
 ## Reading the code
 
@@ -126,11 +130,11 @@ I did omit there the key setup, but it's probably fairly obvious if you understa
 
 ### The network interaction
 
-Obviously this is just for demonstration purposes, but we have N different instances of `musigparticipant.py`, each one serves on a random TCP port (but they all calculate each others' ports based on the chosen index). They speak a simple protocol with message types and text lines containing fields as defined [here](https://github.com/AdamISZ/3roundmusig4fun/blob/adfdb7112721ac9d009b917294e67b8d1a582600/musigparticipant.py#L58-L64).
+Obviously this is just for demonstration purposes, but we have N different instances of `musigparticipant.py`, each one serves on a random TCP port (but they all calculate each others' ports based on the chosen index). They speak a simple protocol with message types and text lines containing fields as defined [here](https://github.com/AdamISZ/3roundmusig4fun/blob/53e8b744314bc0842e6b373efee0a72dd47c9aab/musigparticipant.py#L20-L37). Each participant (the class representing them is [here](https://github.com/AdamISZ/3roundmusig4fun/blob/53e8b744314bc0842e6b373efee0a72dd47c9aab/musigparticipant.py#L70) is running multiple signing contexts (e.g. 3 signing contexts for N participants, each a different transaction spending out to a different party). Messages are multiplexed across the different signing contexts in parallel.
 
-The index 0 participant acts as a coordinator and starts off the process, after a delay, sending a key exchange message, which kicks off all the others. Once keys are exchanged they can all publish the address corresponding to $\sum \left(H(L,P_i) P_i\right) $. They then have to wait for the user to fund that address.
+The index 0 participant acts as a coordinator and starts off the process, after a delay, sending key exchange messages for each signing context, which kicks off all the others. Once keys are exchanged they can all publish the addresses corresponding to $\sum \left(H(L,P_i) P_i\right) $. They then have to wait for the users to fund those addresses. (And this is done N times in parallel).
 
-After the user funds the address he has to enter the funding details as per above. Then the `MS3AManager` object can kick off sending messages 1, 2 and 3 as described above.
+After the user funds the addresses he has to enter the funding details as per above. Then the `MS3AManager` objects encapsulated by the `MS3AParticipant` (N of them) can kick off sending messages 1, 2 and 3 as described above.
 
 Footnote:
 Since we are interested in investigating signature adaptors, especially multiple of them, it is a bit easier and safer to deal with a 3 round variant where **every user-generated point is committed to up-front** (i.e. it's somewhat in the spirit of 'don't roll your own crypto' to commit to everything at the start in those more whacky scenarios, so 3 round is a logical way to start for that.
