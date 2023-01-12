@@ -48,7 +48,7 @@ In the actual running of these scripts (instructions below), all participants wi
 
 This is set up in such a way that each participant will use the *same* adaptor across multiple signing events, so that the revelation of the secret `t` value, from the broadcast of any one transaction, will allow the enforcement of all the other transactions. See 'running a test' below on how to do it. Or, if you just want to understand it, see the above mentioned blog post.
 
-<a name="adaptors" />
+<a name="installing" />
 
 ## Installing dependencies
 
