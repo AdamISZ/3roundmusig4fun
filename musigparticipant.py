@@ -3,6 +3,8 @@ import os
 import json
 from binascii import hexlify, unhexlify
 from typing import Tuple, Callable
+from optparse import OptionParser, OptionValueError
+from configparser import NoOptionError
 from ms3a import (MS3A, AdaptorizedMS3A, MS3A_STATE_NONCES_EXCHANGED,
                   MS3A_STATE_FULLY_SIGNED, DETERMINISTIC_TEST, GROUPN)
 from twisted.protocols import basic
@@ -16,7 +18,7 @@ from bitcointx.core import (CTxOut, CMutableTransaction,
             CMutableTxInWitness, CMutableOutPoint, CMutableTxIn)
 from bitcointx.wallet import P2TRCoinAddress, CCoinAddress
 from bitcointx.core.script import CScriptWitness
-from jmbitcoin import human_readable_transaction
+from jmbitcoin import human_readable_transaction, select_chain_params
 from jmbase import JMHiddenService
 from bip340schnorr import bytes_from_int, int_from_bytes
 port_base = 61529
@@ -81,6 +83,7 @@ class MS3AParticipant(object):
     this object:
     - owns the secret keys, of which there are N
     - owns the single adaptor secret
+    - owns a final destination address for this participant
     - owns N MS3AManager objects which manage
     a single signing context with the other participants
     - manages the network interaction between this
@@ -89,18 +92,25 @@ class MS3AParticipant(object):
     the first argument to the constructor.
     """
     def __init__(self, onions: Tuple[str], privkeys: Tuple[CKey],
-                 n: int, myindex: int, scindex_max: int, ouradaptor: bytes=b""):
+                 destination_addr: str, n: int, myindex: int,
+                 scindex_max: int, ouradaptor: bytes=b""):
         self.myindex = myindex
         self.n = n
         self.signing_contexts = []
         self.scindex_max = scindex_max
+        self.destination_addresses = [None] * self.n
+        # the destination addresses are at *our* index,
+        # while our funding is at index + 1 % n. We set
+        # ours now, but wait for key exchange to set the others.
+        self.destination_addresses[myindex] = destination_addr
 
         # these manage instantiation of network communication
         # protocols, see MS3AProtocol
         self.factories = {}
         for k in range(scindex_max):
             self.signing_contexts.append(MS3AManager(
-                privkeys[k], n, myindex, k,
+                privkeys[k], self.destination_addresses[k],
+                n, myindex, k,
                 ouradaptor=ouradaptor,
                 send_callback=self.send,
                 adaptor_safety_callback=self.check_adaptor_consistency))
@@ -125,24 +135,27 @@ class MS3AParticipant(object):
         for s in self.signing_contexts:
             s.ms3a.set_adaptor_secret(secret)
 
-    def check_adaptor_consistency(self) -> bool:
+    def check_adaptor_consistency(self) -> int:
         """ This should be called *before* sending
         partial signatures, in order to ensure safety
         of receipt of adaptor secrets on full signatures.
+        There are three return values:
+        1 : all adaptors are received and are consistent
+        -1: there is an inconsistency in the received adaptors
+        0: not all adaptors are yet received
         """
-        Tchecks = {}
-        for s in self.signing_contexts:
-            for i in range(self.n):
-                if i == self.myindex:
-                    continue
-                if i in Tchecks:
-                    if s.ms3a.Ts[i] != Tchecks[i]:
-                        print("Mismatch on adaptors, aborting: {}, {}".format(
-                            s.ms3a.Ts[i], Tchecks[i]))
-                        return False
-                    else:
-                        Tchecks[i] = s.ms3a.Ts[i]
-        return True
+        for i in range(self.n):
+            if i == self.myindex:
+                continue
+            ts_for_i = [s.ms3a.Ts[i] for s in self.signing_contexts]
+            if None in ts_for_i:
+                return 0
+            first = ts_for_i[0]
+            if not all(elem == first for elem in ts_for_i):
+                print("Mismatch on adaptors at index {}, aborting: {}".format(
+                    i, ts_for_i))
+                return -1
+        return 1
 
     def start_key_exchange(self):
         # current simple model: index 0 is always coordinator
@@ -187,7 +200,7 @@ class MS3AParticipant(object):
             #print("Failed to send to {}, message was: {}".format(
             #    counterparty_index, msg.text))
             # keep trying in case connection drops happen:
-            reactor.callLater(1.0, self.send, counterparty_index, msg)
+            reactor.callLater(4.0, self.send, counterparty_index, msg)
 
     def receive_message(self, message: MS3AMessage):
         """ This sends the message to the right callback,
@@ -207,12 +220,15 @@ class MS3AParticipant(object):
 
 class MS3AManager(object):
 
-    def __init__(self, privkey: CKey, n: int, myindex: int, scindex: int,
+    def __init__(self, privkey: CKey, destn_addr, n: int, myindex: int, scindex: int,
                  send_callback: Callable, adaptor_safety_callback: Callable,
                  ouradaptor: bytes=b""):
         # create a private key and public key, then
         # be ready to receive messages.
         self.privkey = privkey
+        # the destination address may, at this point, be either
+        # an address, or None (if we have to wait for key exchange to get it)
+        self.destn_addr = destn_addr
         # number of counterparties
         self.n = n
         self.myindex = myindex
@@ -262,15 +278,13 @@ class MS3AManager(object):
                 if len(lines) > 0:
                     print("We saw a line in the file: ", lines[0])
                     # txid:n of the utxo being spent are the first two.
-                    # then, value and script refer to the same utxo, and
-                    # allow us to create a CTxOut for it.
-                    # lastly, we need value, address for the recipient, from
-                    # which we create the transaction output (another CTxOut)
-                    hextxid, strindex, strvalue, inaddress, strvalout, address = lines[0].strip().split(",")
+                    # the third is the value in satoshis being spent.
+                    # meanwhile, the txfee is hardcoded to 5K sats and the
+                    # destination address (1 to 1) is already defined.
+                    hextxid, strindex, strvalue= lines[0].strip().split(",")
                     for i in range(self.n):
                         self.send_funding_message(i, hextxid,
-                                        int(strindex), int(strvalue), inaddress,
-                                        int(strvalout), address)
+                                        int(strindex), int(strvalue))
                     self.funding_received = True
         except OSError:
             # ignore non-existence
@@ -283,7 +297,12 @@ class MS3AManager(object):
         self.send_callback(counterparty_index, msg)
 
     def send_key_exchange_message(self, index):
-        msg = self.create_ms3a_message((hexlify(self.ms3a.basepubkey).decode(),), 1)
+        if self.destn_addr is None:
+            destmsg = ""
+        else:
+            destmsg = str(self.destn_addr)
+        msg = self.create_ms3a_message((hexlify(self.ms3a.basepubkey).decode(),
+                                        destmsg), 1)
         self.send(index, msg)
 
     def send_commitment_exchange_message(self, index):
@@ -301,14 +320,10 @@ class MS3AManager(object):
         self.send(index, msg)
 
     def send_funding_message(self, index: int, hextxid: str, spending_index: int,
-                             value: int, inaddress: str, valueout: int,
-                             addrout: str):
+                             value: int):
         msg = self.create_ms3a_message((hextxid,
                                        str(spending_index),
-                                       str(value),
-                                       inaddress,
-                                       str(valueout),
-                                       addrout), 2)
+                                       str(value)), 2)
         if index == self.myindex:
             self.receive_funding_notification(msg)
         else:
@@ -359,10 +374,17 @@ class MS3AManager(object):
         except:
             print("Failed key exchange message: ", msg)
             return
+        # Set the destination if the right counterparty
+        if self.scindex == index:
+            assert msg.get_vals()[1] != ""
+            self.destn_addr = msg.get_vals()[1]
         if not self.ms3a.musig_address and self.ms3a.set_base_pubkey(pub, index):
             # key exchange is complete; start by sending msg1
             print("Key exchange complete")
-            print("Address to fund is: ", self.ms3a.get_musig_address())
+            if self.scindex == (self.myindex + 1) % self.n:
+                print("You are index {}. You should fund the musig address"
+                      " for signing session {}, which is: {}".format(self.myindex,
+                    (self.myindex + 1) % self.n, self.ms3a.get_musig_address()))
         if not self.key_sent:
             for i in range(self.n):
                 if i == self.myindex:
@@ -445,12 +467,12 @@ class MS3AManager(object):
         txid = unhexlify(msg.get_vals()[0])
         outindex = int(msg.get_vals()[1])
         spent_val = int(msg.get_vals()[2])
-        spent_script = P2TRCoinAddress(msg.get_vals()[3]).to_scriptPubKey()
+        spent_script = self.ms3a.musig_address.to_scriptPubKey()
         spending_out = CTxOut(spent_val, spent_script)
         outpoint = CMutableOutPoint(txid[::-1], outindex)
         vin = [CMutableTxIn(prevout=outpoint, nSequence=0xffffffff)]
-        outsPK = CCoinAddress(msg.get_vals()[5]).to_scriptPubKey()
-        receiving_val = int(msg.get_vals()[4])
+        outsPK = CCoinAddress(self.destn_addr).to_scriptPubKey()
+        receiving_val = spent_val - 5000
         vout = [CTxOut(receiving_val, outsPK)]
         tx2 = CMutableTransaction(vin, vout, nVersion=2)
         self.ms3a.set_transaction_message(tx2, 0, spending_out)
@@ -490,8 +512,11 @@ class MS3AManager(object):
                     [int_from_bytes(x) for x in adaptor_secrets]) % GROUPN)
                 print("We got an aggregated adaptor secret of: ",
                       hexlify(self.aggregated_adaptor_secret))
-            if self.myindex == 0:
-                print("Attempting to broadcast.")
+            if self.myindex == self.scindex:
+                # we set the destination address to our own, for our own
+                # index in the list of signing sessions, so we want to
+                # broadcast this one:
+                print("Attempting to broadcast spend into my address!")
                 self.broadcast_spend()
 
     def check_send_partials(self):
@@ -502,10 +527,18 @@ class MS3AManager(object):
         # We only care about *others'* sig adaptors, not our own (null or not):
         sig_adaptors_to_check = self.sig_adaptors[:myindex] + self.sig_adaptors[myindex+1:]
         if all(sig_adaptors_to_check):
-            if not self.adaptor_safety_callback():
+            x = self.adaptor_safety_callback()
+            if x == -1:
                 print("Not sending partial signatures; adaptors "
                       "in different signing contexts don't match.")
                 return
+            if x == 0:
+                # we may still be waiting for funding to occur in the
+                # other signing sessions, so that we need to wait until
+                # we can check that all the T values match:
+                reactor.callLater(1.0, self.check_send_partials)
+                return
+            assert x == 1
             # Having received all makes us safe to send, since
             # any secrets we need, we will now know:
             print("We have received all sig adaptor messages, "
@@ -544,6 +577,9 @@ class MS3AManager(object):
     def broadcast_spend(self):
         # Key path signing only requires one witness element: the signature,
         # inserted manually here.
+        # For now this is left as a manual print, for user to copy-paste
+        # into actual broadcast.
+        print("But currently you have to broadcast it manually:")
         self.ms3a.tx.wit.vtxinwit[0] = CMutableTxInWitness(
             CScriptWitness([self.ms3a.full_signature]))
         print(hexlify(self.ms3a.tx.serialize()))
@@ -632,7 +668,6 @@ class MS3AClientFactory(protocol.ReconnectingClientFactory):
         # we may be sending at the time the counterparty
         # disconnected
         if not self.proto_client:
-            print("Could not send, connection not active.")
             return False
         self.proto_client.message(msg)
         return True
@@ -640,13 +675,46 @@ class MS3AClientFactory(protocol.ReconnectingClientFactory):
     def receive_message(self, message: MS3AMessage,
                         p: MS3AProtocol) -> None:
         self.message_receive_callback(message)
-    
 
-# Crude argument passing setup: myindex, total participants, boolean 1/0 for adaptor:
+parser = OptionParser(
+        usage='usage: %prog [my index] [number of participants] [receiving address]',
+        description=
+        'Runs N-party adaptor based coin swap'
+        ' an attempt to break the link between them. Sending to multiple '
+        ' addresses is highly recommended for privacy. This tumbler can'
+        ' be configured to ask for more address mid-run, giving the user'
+        ' a chance to click `Generate New Deposit Address` on whatever service'
+        ' they are using.')
+parser.add_option('--bootstrap',
+    action='store_true',
+    dest='bootstrap',
+    default=False,
+    help=('If set to true, program just prints out .onion address'
+           'to share with counterparties'))
+parser.add_option('--deterministic',
+    action='store_true',
+    dest='deterministic',
+    default=False,
+    help=('If set to true, uses unsafe secret keys that'
+          ' are fixed small integers.'))
+parser.add_option('--network',
+                  type='string',
+                  dest='network',
+                  default='regtest',
+                  help=('Set to either signet or regtest'))
 
-myindex = int(sys.argv[1])
+(options, args) = parser.parse_args()
 
-ncounterparties = int(sys.argv[2])
+myindex = int(args[0])
+
+ncounterparties = int(args[1])
+
+# TODO address check but maybe not jmclient version
+my_destination = args[2]
+
+# this is also referred to in ms3a.py; bit messy
+if options.deterministic:
+    DETERMINISTIC_TEST = options.deterministic
 
 if DETERMINISTIC_TEST:
     oursecrets = [bytes([myindex+1+q]*32) for q in range(ncounterparties)]
@@ -658,19 +726,22 @@ if DETERMINISTIC_TEST:
 else:
     ouradaptor = os.urandom(32)
 
-# Set these strings all to "", to bootstrap: your onion hostname will be printed (just *.onion, no port).
-# Then, after exchanging these strings with your counterparties, edit it to include all onions for the run.
-onions = ["", "", ""]
-#onions = ["6xapwqugm5i63625hqif45joly33h7nf63c6ecwr6feshybnkwiiutqd.onion", "uqiedohr7vorc6ssarerso4ruw2nu5ug5qjgvcgvvw3czvraccqj2aqd.onion", "ouhdwwzqz5u6tskbb62l4eed4uay3kkbvshyzxe2676lerhd56ryi6id.onion"]
+# Sets these strings all to "", to bootstrap: your onion hostname will be printed (just *.onion, no port).
+# Then, after exchanging these strings with your counterparties, run without `--bootstrap` option
+if options.bootstrap:
+    onions = ["", "", ""]
+else:
+    onions = ["6xapwqugm5i63625hqif45joly33h7nf63c6ecwr6feshybnkwiiutqd.onion", "uqiedohr7vorc6ssarerso4ruw2nu5ug5qjgvcgvvw3czvraccqj2aqd.onion", "ouhdwwzqz5u6tskbb62l4eed4uay3kkbvshyzxe2676lerhd56ryi6id.onion"]
 
-assert len(onions) == ncounterparties
+assert len(onions) == ncounterparties, "you must provide exactly one onion address per counterparty"
+
+if options.network != "regtest":
+    print("Setting network to: ", options.network)
+    select_chain_params("bitcoin/" + options.network)
 
 x = MS3AParticipant(onions, [CKey.from_secret_bytes(s) for s in oursecrets],
-                    ncounterparties, myindex, ncounterparties,
+                    my_destination, ncounterparties, myindex, ncounterparties,
                     ouradaptor=ouradaptor)
-
-# used for local testing
-my_port = port_base + myindex
 
 # The spending transaction will be processed from a file:
 for sc in x.signing_contexts:
