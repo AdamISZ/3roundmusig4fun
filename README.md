@@ -141,12 +141,11 @@ There is no '14' here but a really good test would involve, say, Alice broadcast
 
 ## Reading the code
 
-More technical in the weeds stuff goes here, so a casual reader (or non-coder) can ignore it.
+More technical in the weeds stuff goes here, so a casual reader (or non-coder) can ignore it. This is WIP.
 
 The module `ms3a.py` (short with MuSig 3-round with adaptors) is organized around an object `MS3A` which manages (a) the key setup and then (b) the 3 messages. Note that since we want to try using adaptors at some point, the first message is now:
 
-* `H(R), H(T)` - where `H` means hash, by default SHA256 and `R`, `T` are elliptic curve points serialized in old-style compressed form, where `R` is the nonce and `T` is an adaptor point. As for now, this `T` is set to something random and unused in signing.
-
+* `H(R), H(T)` - where `H` means hash, by default SHA256 and `R`, `T` are elliptic curve points serialized in old-style compressed form, where `R` is the nonce and `T` is an adaptor point. As for now, this `T` is set to something random and unused in signing..
 The second round message is purely the opening of the first:
 
 * `R`, `T`
@@ -159,15 +158,5 @@ This obviously needs some unpacking. Read the extensive comments in the code, bu
 
 I did omit there the key setup, but it's probably fairly obvious if you understand the above equation: each "aggregated pubkey" is `H(L||P_i)P_i`.
 
-### The network interaction
-
-Obviously this is just for demonstration purposes, but we have N different instances of `musigparticipant.py`, each one serves on a random TCP port (but they all calculate each others' ports based on the chosen index). They speak a simple protocol with message types and text lines containing fields as defined [here](https://github.com/AdamISZ/3roundmusig4fun/blob/53e8b744314bc0842e6b373efee0a72dd47c9aab/musigparticipant.py#L20-L37). Each participant (the class representing them is [here](https://github.com/AdamISZ/3roundmusig4fun/blob/53e8b744314bc0842e6b373efee0a72dd47c9aab/musigparticipant.py#L70) is running multiple signing contexts (e.g. 3 signing contexts for N participants, each a different transaction spending out to a different party). Messages are multiplexed across the different signing contexts in parallel.
-
-The index 0 participant acts as a coordinator and starts off the process, after a delay, sending key exchange messages for each signing context, which kicks off all the others. Once keys are exchanged they can all publish the addresses corresponding to $\sum \left(H(L,P_i) P_i\right) $. They then have to wait for the users to fund those addresses. (And this is done N times in parallel).
-
-After the user funds the addresses he has to enter the funding details as per above. Then the `MS3AManager` objects encapsulated by the `MS3AParticipant` (N of them) can kick off sending messages 1, 2 and 3 as described above.
-
-Footnote:
-Since we are interested in investigating signature adaptors, especially multiple of them, it is a bit easier and safer to deal with a 3 round variant where **every user-generated point is committed to up-front** (i.e. it's somewhat in the spirit of 'don't roll your own crypto' to commit to everything at the start in those more whacky scenarios, so 3 round is a logical way to start for that.
 
 
