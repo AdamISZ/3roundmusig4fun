@@ -7,15 +7,24 @@ from ms3a import (MS3A, AdaptorizedMS3A, MS3A_STATE_NONCES_EXCHANGED,
                   MS3A_STATE_FULLY_SIGNED, DETERMINISTIC_TEST, GROUPN)
 from twisted.protocols import basic
 from twisted.internet import reactor, protocol, task, endpoints
+from twisted.application.internet import ClientService
+from twisted.internet.endpoints import TCP4ClientEndpoint
+from txtorcon.socks import (TorSocksEndpoint, HostUnreachableError,
+                            SocksError, GeneralServerFailureError)
 from bitcointx.core.key import CKey, CPubKey
 from bitcointx.core import (CTxOut, CMutableTransaction,
             CMutableTxInWitness, CMutableOutPoint, CMutableTxIn)
 from bitcointx.wallet import P2TRCoinAddress, CCoinAddress
 from bitcointx.core.script import CScriptWitness
 from jmbitcoin import human_readable_transaction
+from jmbase import JMHiddenService
 from bip340schnorr import bytes_from_int, int_from_bytes
 port_base = 61529
 hostname = "localhost"
+ONION_VIRTUAL_PORT = 5321
+# How many seconds to wait before treating an onion
+# as unreachable
+CONNECT_TO_ONION_TIMEOUT = 60
 
 class MS3AMessage(object):
     """ Encapsulates the messages passed over the wire
@@ -75,10 +84,12 @@ class MS3AParticipant(object):
     - owns N MS3AManager objects which manage
     a single signing context with the other participants
     - manages the network interaction between this
-    participant and the other participants
+    participant and the other participants; all reachable
+    network destinations must be passed as onion hostnames in
+    the first argument to the constructor.
     """
-    def __init__(self, privkeys: Tuple[CKey], n: int, myindex: int,
-                 scindex_max: int, ouradaptor: bytes=b""):
+    def __init__(self, onions: Tuple[str], privkeys: Tuple[CKey],
+                 n: int, myindex: int, scindex_max: int, ouradaptor: bytes=b""):
         self.myindex = myindex
         self.n = n
         self.signing_contexts = []
@@ -101,10 +112,14 @@ class MS3AParticipant(object):
         for i in range(n):
             if i == self.myindex:
                 continue
-            port_to_use = port_base + i
-            self.connect(i, port_to_use)
+            self.connect(i, onions[i])
+        self.connected_counter = 0
 
-        reactor.callLater(10.0, self.start_key_exchange)
+    def onion_hostname_callback(self, hostname):
+        """ Just informational; allows bootstrapping,
+        by printing the hostname.
+        """
+        print("We are starting a hidden service at: ", hostname)
 
     def set_adaptor_secret(self, secret:bytes):
         for s in self.signing_contexts:
@@ -130,32 +145,49 @@ class MS3AParticipant(object):
         return True
 
     def start_key_exchange(self):
+        # current simple model: index 0 is always coordinator
         if not self.myindex == 0:
             return
         for i in range(0, self.scindex_max):
             self.signing_contexts[i].start_key_exchange()
 
     def register_connection(self):
-        self.able_to_send = True
+        """ This code is naively optimistic; if we registered
+        all the connections, we assume they're all up.
+        """
+        self.connected_counter += 1
+        print("We have connected to", self.connected_counter, "participants.")
+        if self.connected_counter == self.n - 1:
+            self.start_key_exchange()
 
     def register_disconnection(self):
-        self.able_to_send = False
+        self.connected_counter -= 1
+        pass
 
-    def connect(self, index: int, port: int) -> None:
+    def connect(self, index: int, onion: str) -> None:
+        # allows a bootstrap, where connect is a no-op:
+        if onion == "":
+            return
         if index in self.factories:
             return
         self.factories[index] = MS3AClientFactory(self.receive_message,
         self.register_connection, self.register_disconnection)
-        print("{} is making a tcp connection to {}, {}".format(
-            self.myindex, index, port))
-        self.tcp_connector = reactor.connectTCP(hostname, port,
-                                                self.factories[index])
+        torEndpoint = TCP4ClientEndpoint(reactor, "localhost",
+                                         9050,
+                                         timeout=CONNECT_TO_ONION_TIMEOUT)
+        onionEndpoint = TorSocksEndpoint(torEndpoint, onion,
+                                         ONION_VIRTUAL_PORT)
+        self.reconnecting_service = ClientService(onionEndpoint, self.factories[index])
+        print("Now trying to connect to : " + onion + str(ONION_VIRTUAL_PORT))
+        self.reconnecting_service.startService()
 
     def send(self, counterparty_index: int, msg: MS3AMessage):
         res = self.factories[counterparty_index].send(msg)
         if not res:
-            print("Failed to send to {}, message was: {}".format(
-                counterparty_index, msg.text))
+            #print("Failed to send to {}, message was: {}".format(
+            #    counterparty_index, msg.text))
+            # keep trying in case connection drops happen:
+            reactor.callLater(1.0, self.send, counterparty_index, msg)
 
     def receive_message(self, message: MS3AMessage):
         """ This sends the message to the right callback,
@@ -196,7 +228,8 @@ class MS3AManager(object):
                               3: self.receive_commitments,
                               4: self.receive_nonces,
                               5: self.receive_partial,
-                              6: self.receive_signature_adaptor}
+                              6: self.receive_signature_adaptor,
+                              7: self.receive_nonce_exchange_complete} # 7 is actually after 4
         self.adaptor_safety_callback = adaptor_safety_callback
         # boolean lets us kick off process only once
         self.kicked_off = False
@@ -204,6 +237,7 @@ class MS3AManager(object):
         self.funding_received = False
         self.able_to_send = False
         self.key_sent = False
+        self.nonce_calc_complete = {}
         self.sig_adaptors = [None] * n
 
     def start_key_exchange(self):
@@ -263,6 +297,7 @@ class MS3AManager(object):
         msg = self.create_ms3a_message((hexlify(
             self.ms3a.Rs[self.myindex]).decode(),
             hexlify(self.ms3a.Ts[self.myindex]).decode()), 4)
+        self.nonce_calc_complete[self.myindex] = True
         self.send(index, msg)
 
     def send_funding_message(self, index: int, hextxid: str, spending_index: int,
@@ -279,6 +314,10 @@ class MS3AManager(object):
         else:
             self.send(index, msg)
 
+    def send_nonce_exchange_complete(self, index):
+        msg = self.create_ms3a_message(("NONCE_EXCHANGE_COMPLETE",), 7)
+        self.send(index, msg)
+
     def send_partials_exchange_message(self, index):
         msg = self.create_ms3a_message((hexlify(
             self.ms3a.fullpartials[self.myindex]).decode(),), 5)
@@ -288,8 +327,6 @@ class MS3AManager(object):
         msg = self.create_ms3a_message((hexlify(
             self.ms3a.get_signature_adaptor()).decode(),), 6)
         self.send(index, msg)
-
-
 
     def receive_message(self, message: MS3AMessage):
         """ This sends the message to the right callback,
@@ -373,12 +410,29 @@ class MS3AManager(object):
         if not self.ms3a.receive_ms3a_msg_2(R, T, index):
             print("Run was aborted due to invalid commitment opening.")
         elif self.ms3a.state >= MS3A_STATE_NONCES_EXCHANGED:
-            # we now have at least our own partial; send it
             for i in range(self.n):
                 if i == self.myindex:
                     continue
-                self.send_signature_adaptor_message(i)
-                #self.send_partials_exchange_message(i)
+                self.send_nonce_exchange_complete(i)
+
+    def receive_nonce_exchange_complete(self, msg: MS3AMessage):
+        if not msg.get_vals()[0] == "NONCE_EXCHANGE_COMPLETE":
+            print("invalid nonce exchange complete message")
+            return
+        i = msg.get_counterparty_index()
+        if i in self.nonce_calc_complete:
+            print("Received duplicate notification of nonce "
+                  "exchange complete from", i)
+            return
+        self.nonce_calc_complete[i] = True
+        if all(self.nonce_calc_complete.values()):
+            # Once everyone has nonces, we can all verify each
+            # others' adaptors, which is why we wait to send them
+            # until we know everyone is finished with MuSig steps 1,2.
+            for j in range(self.n):
+                if j == self.myindex:
+                    continue
+                self.send_signature_adaptor_message(j)
 
     def receive_funding_notification(self, msg: MS3AMessage):
         """ This spending information could come from any participant.
@@ -461,7 +515,7 @@ class MS3AManager(object):
                     continue
                 self.send_partials_exchange_message(i)
         else:
-            print("All sig adaptors were not, here is: ", sig_adaptors_to_check)
+            print("Not all sig adaptors yet received, continuing.")
 
     def receive_signature_adaptor(self, msg: MS3AMessage):
         index = msg.get_counterparty_index()
@@ -599,22 +653,42 @@ if DETERMINISTIC_TEST:
 else:
     oursecrets = [os.urandom(32) for _ in range(ncounterparties)]
 
-include_adaptor = int(sys.argv[3])
-
 if DETERMINISTIC_TEST:
     ouradaptor = bytes([myindex+47]*32)
 else:
     ouradaptor = os.urandom(32)
 
-x = MS3AParticipant([CKey.from_secret_bytes(s) for s in oursecrets],
+# Set these strings all to "", to bootstrap: your onion hostname will be printed (just *.onion, no port).
+# Then, after exchanging these strings with your counterparties, edit it to include all onions for the run.
+onions = ["", "", ""]
+#onions = ["6xapwqugm5i63625hqif45joly33h7nf63c6ecwr6feshybnkwiiutqd.onion", "uqiedohr7vorc6ssarerso4ruw2nu5ug5qjgvcgvvw3czvraccqj2aqd.onion", "ouhdwwzqz5u6tskbb62l4eed4uay3kkbvshyzxe2676lerhd56ryi6id.onion"]
+
+assert len(onions) == ncounterparties
+
+x = MS3AParticipant(onions, [CKey.from_secret_bytes(s) for s in oursecrets],
                     ncounterparties, myindex, ncounterparties,
                     ouradaptor=ouradaptor)
+
+# used for local testing
 my_port = port_base + myindex
 
 # The spending transaction will be processed from a file:
 for sc in x.signing_contexts:
     task.LoopingCall(sc.check_for_funding).start(2.0)
-endpoints.serverFromString(reactor,
-    "tcp:"+str(my_port)).listen(MS3AFactory(x))
+
+hs = JMHiddenService(MS3AFactory(x), print,
+                                      print,
+                                      x.onion_hostname_callback,
+                                      "localhost",
+                                      9051,
+                                      "127.0.0.1",
+                                      8080,
+                                      virtual_port=ONION_VIRTUAL_PORT,
+                                      shutdown_callback=print,
+                                      hidden_service_dir="hidserv" + str(myindex))
+# this call will start bringing up the HS; when it's finished,
+# it will fire the `onion_hostname_callback`.
+hs.start_tor()
+
 reactor.run()
 
