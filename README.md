@@ -1,9 +1,11 @@
-# Experimenting with MuSig (the 3-round variant) in Bitcoin
+# Experimenting with multiparty coin swaps using MuSig (the 3-round variant)
+
+If you're not interested in the background and just want to do something, skip [here](#running).
+
+## Background on the MuSig part of this codebase
 
 If you want to play with this, for example if you're trying to understand the mechanics of how MuSig concretely works, or if, like me, you're interested in experimenting with signature adaptors (which are now fully possible on Bitcoin), then this repo might be of interest, especially if you're still in a learning stage.
-If you want to do real world work though, there isn't much of interest here, mostly because the underlying crypto operations are being done in an unsafe way in Python.
-
-Here is a 7.5 minute video of what running the code actually does: https://www.youtube.com/watch?v=YhH2zqkJK_w ; culminating in a spending event that looks like a normal p2tr (keypath) spend, like [this](https://mempool.space/signet/tx/5e21e25cfb7d447536c49950ce412b91f0a9a4ec44fd416a66a041eb6ccfa149).
+Note that the underlying crypto operations are being done in an unsafe way in Python. This is not safe for real world use (at all).
 
 ### Before we begin: how does MuSig work at all?
 
@@ -38,13 +40,15 @@ Using MuSig is using the former. So we set, here, the script to `""`, i.e. delib
 
 <a name="adaptors" />
 
-### Adaptors
+### Adaptors and how they are used here
 
-All participants will be sending to their counterparts, before receiving partial signatures, a *signature adaptor* that promises to reveal the discrete log of a point (or public key) `T`, deducible by subtraction, from the full partial signature of this participant. The preceding is probably nearly unintelligible if you haven't already studied signature adaptors. For a full-ish treatment of how *this* code is using adaptors, see my blog post [here](https://reyify.com/blog/multiparty-s6). For a more general description of what they are, see [this](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki#adaptor-signatures).
+In the actual running of these scripts (instructions below), all participants will be sending to their counterparts, before receiving partial signatures, a *signature adaptor* that promises to reveal the discrete log of a point (or public key) `T`, deducible by subtraction, from the full partial signature of this participant. The preceding is probably nearly unintelligible if you haven't already studied signature adaptors. For a full-ish treatment of how *this* code is using adaptors, see my blog post [here](https://reyify.com/blog/multiparty-s6). For a more general description of what they are, see [this](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki#adaptor-signatures).
 
 ( *As you can see, my 'campaign' to rename them signature adaptors, and not adaptor signatures, has been spectacularly unsuccessful. The latter name is dangerous because they are categorically not signatures; you do not need a private key to create one.*)
 
 This is set up in such a way that each participant will use the *same* adaptor across multiple signing events, so that the revelation of the secret `t` value, from the broadcast of any one transaction, will allow the enforcement of all the other transactions. See 'running a test' below on how to do it. Or, if you just want to understand it, see the above mentioned blog post.
+
+<a name="adaptors" />
 
 ## Installing dependencies
 
@@ -63,7 +67,11 @@ source jmvenv/bin/activate
 
 Latest release or master should both be fine; we are only actually using `jmbitcoin` here.
 
-If it isn't, you'll want to read that project's `README.md` for more, and then possibly the `docs/INSTALL.md`.
+If it isn't that simple, you'll want to read that project's `README.md` for more, and then possibly the `docs/INSTALL.md`.
+
+Note that this project uses Joinmarket's function of starting an onion service (as used for yieldgenerators), so you probably want to read [here](https://github.com/JoinMarket-Org/joinmarket-clientserver/blob/master/docs/tor.md#configuring-tor-to-setup-an-onion-service).
+
+If the install is complete and you have `(jmvenv)` on your CLI prompt, you only need to do one more thing before starting:
 
 ### python-bitcointx taproot support
 
@@ -75,42 +83,65 @@ Luckily you can just install ( *inside the JM venv as per above* ) using pip eas
 pip install git+https://github.com/Simplexum/python-bitcointx.git@d5ff9b02b7fb983e61b30fe00373f1dad30628ca
 ```
 
-## Running a test
+<a name="running" />
+
+## How to do a multiparty coinswap using this code
 
 Steps:
 
-* Choose `regtest` or `signet` and enter that string on this line (yeah should be config file, whatever):
+1. Gather N people in a communication channel (this might be the hard part! except, it's only a test with play coins, so nothing to worry about!). Each one of them needs to have some coins in a wallet.
 
-https://github.com/AdamISZ/3roundmusig4fun/blob/a9c4989f1845e4166f04c896c1e5cb97f46e4afe/ms3a.py#L3
+2. Choose `signet` (if you're working on your own, use `regtest`, but for a group, signet will work a lot better than testnet).
 
-* Run `N` instances of `musigparticipant.py` (3 seems a good start), like this:
+3. Install the dependencies. There are two elements to this, and they're specified in the [section above](#installing).
+
+4. Decide on a numbering of the N people. E.g. Alice, Bob Carol can be 0, 1, 2. Alice here has a special role of 'coordinator', in only one sense: she has to enter the transaction funding details as explained below.
+
+5. Run `python musigparticipant.py --help` to see the options (the only one you probably care about is `--network signet`) and the arguments. They are `myindex`, `number of counterparties` and `destination address`. Source the last one from your signet wallet. This is where coins will go *from* the musig address, back to you.
+
+6. Run `python musigparticipant.py --bootstrap` and note down the `**.onion` address that it shows you. Send that to each other participant.
+
+7. Once everyone has the full list (e.g. 3 onion addresses if 3 participants), then they must put them, in order, at the bottom of the `musigparticipant.py`, in the entry for `onions=[xx.onion,...]`, replacing the hardcoded examples.
+
+8. Now each person can run `python musigparticipant.py myindex ncounterparties mydestinationaddress`. After some time all should be able to connect to all, and should share key exchange information that allows N musig addresses to get created. Each person's output will look like:
 
 ```
-(jmvenv)$ python musigparticipant.py 0 3
+(jmvenv) a@b:$python musigparticipant.py 0 3 bcrt1qaexgf476anael7fg93efnqp6kx3dl0l4s8e6wv
+Attempting to start onion service on port: 5321 ...
+We are starting a hidden service at:  6xapwqugm5i63625hqif45joly33h7nf63c6ecwr6feshybnkwiiutqd.onion
+We have connected to 1 participants.
+We have connected to 2 participants.
+Key exchange complete
+Key exchange complete
+You are index 0. You should fund the musig address for signing session 1, which is: bcrt1pm9lj8uefng650m6lf38e59mhlqj2a62uw8naxjncdxxjn7zd8jhsp3csg2
 ```
 
-replacing `0` with `1`, `2`, in different terminals. They will all connect to each other (they talk to each other on random ports), then negotiate an aggregated pubkey after a short delay. Once that happens, they'll all show you the same funding address for the multisig (it will be a taproot address like `tb1p..` or `bcrt1p..`).
+... and the script will just wait at this point.
 
-* Fund the address and enter the funding details
+9. Once output like that is seen, go ahead and fund the address mentioned. The N parties should agree an amount (the idea is that the amount is ~ the same, since all parties will also *receive* the same amount, minus fees, but for a simple demo the details are somewhat omitted.
 
-To fund the address, use whatever wallet/code you choose. Then, in a file named `./fundingfile[i][j].txt`, (i, j explained in a moment) enter these fields:
+9a. **NOTE THAT THERE IS NO TIMELOCKED BACKOUT TRANSACTION CREATED, BUT THIS WOULD BE ESSENTIAL IN A REAL PROTOCOL** (as otherwise, funding a multisig, of whatever type, could result in the coins being permanently locked up). This is a TODO for this project, though to be clear it is not terribly hard to do.
+
+10. Once all N parties have submitted their funding transactions, they should share the txid:n of the output which funds the described multisig address. Specifically, counterparty at index `i` will, by following the above instructions, be funding the multisig address which, itself, will pay out to counterparty `(i+1) mod n`, i.e. the next "around the loop". They should all give this info to everyone for checking but specifically counterparty 0 (Alice, above) will need it to enter into a file.
+
+11. Counterparty at index 0 (Alice for short) needs to create files `fundingfile0[i].txt` for i from 0 to N-1. In each one she must enter a single line of this format: 
 
 ```
-cc2829751a75cdc002b25ef897cae4987d5a71919a00e116f36265ac8a4f2769,0,508000,tb1pha7uk8tt9c0g4fwrlwvzmzc0jsa46shhx8uf9yhsat4zcz4y3ejqph2076,500000,tb1q3xr7l9nylsdlyqf9rkw0rg3f0yx6slguhtwpzp
+cc2829751a75cdc002b25ef897cae4987d5a71919a00e116f36265ac8a4f2769,0,5000000
 ```
 
-These are examples that I used on signet. The fields are: fundingtxid,funding-output-index,funding-output-amount,musig-address,amount-to-spend,destinationaddress.
+that is, txid, index(output index of the utxo), amount-in-satoshis. So as a concrete example, if Alice, Bob, Carol so 3 of 3, then `fundingfile00.txt` will contain a line with the funding info that was paid-in by Carol, `fundingfile01.txt` will contain a line with the funding info that was paid in by Alice, and `fundingfile02.txt` will contain a line with the funding info that was paid in by Bob. ("Each pays the next").
 
-i: for now, keep it at 0; the 0th (first) participant will be the one reading this file as a trigger. j: this index is for the signing context. We explain that here:
+12. When Alice creates these files her own script will see it, read the funding info, then start the MuSig negotiation. All parties will see the information, and they will not do full signing until they have seen signature adaptors for *all* of the N transactions that have been created, to be signed.
 
-As per the design in the blog post above, we will have N transactions for N parties; each one will spend out of an N of N MuSig address, (let's set N=3 from here) each of those 3 addresses negotiated by the 3 parties. That means 3 executions of the MuSig protocol are done simultaneously, with each of the 3 parties generating 3 pubkeys (i.e. there are 9 pubkeys input to key exchange, in total). 3 spending-out transactions are being signed; 3 funding transactions must occur, paying *into* the 3 MuSig addresses. So, the index `j` deals with that: for this 3 party case, you'll want to create files fundingfile00.txt, fundingfile01.txt, fundingfile02.txt (doesn't matter what order they get created); each one will trigger the adaptor and signature exchange process for that individual signing context.
+13. Once all parties have received over the network, both the funding information, and the nonces and signature adaptors for all of the transactions, and if everything checks out, they will send partial signatures for all the transactions **knowing that at this point they are safe that, if one transaction is broadcast, all the others can be, by using the information in the signature adaptors**.
 
-Each participant only releases partial signatures once they're sure that the adaptor point `T` for each participant is fixed across the 3 signing contexts; it's that property that ensures that, if one spending transaction is broadcast, the other two can also be broadcast.
-
-Obviously this will be cleaned up a bit. The musigaddress is redundant (the code already knows it of course!), and it also only support a 1-in-1-out spend (but that seems fine just for testing).
+There is no '14' here but a really good test would involve, say, Alice broadcasting her transaction but not releasing her partial signatures on the other transactions. Each party should still be able to claim their funds. And similar scenarios. See the blog post for justification.
 
 
 ## Reading the code
+
+More technical in the weeds stuff goes here, so a casual reader (or non-coder) can ignore it.
 
 The module `ms3a.py` (short with MuSig 3-round with adaptors) is organized around an object `MS3A` which manages (a) the key setup and then (b) the 3 messages. Note that since we want to try using adaptors at some point, the first message is now:
 
